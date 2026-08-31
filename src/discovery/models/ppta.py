@@ -34,6 +34,7 @@ from .. import deterministic
 from .. import matrix
 from .. import const
 from discovery.models import mpta
+from .. import phys_ephem as phys_ephem_mod
 
 jnp = matrix.jnp
 
@@ -777,6 +778,7 @@ def make_psr_gps_fourier(
     dm=True,
     chrom=True,
     chrom_alpha=None,
+    chrom_fref=1400.0,
     chrom_poly=False,
     sw=True,
     sw_powerlaw=False,
@@ -808,9 +810,11 @@ def make_psr_gps_fourier(
     if dm:
         gp_signals.append(signals.makegp_fourier(psr, signals.turnover_psd('dm', turnover), components=psr_components, T=psr_Tspan, fourierbasis=signals.fourierbasis_dm, name='dm_gp'))
     if chrom:
-        gp_signals.append(signals.makegp_fourier(psr, signals.turnover_psd('chrom', turnover), components=psr_components, T=psr_Tspan, fourierbasis=signals.fourierbasis_chrom, name='chrom_gp', alpha=chrom_alpha))
+        gp_signals.append(signals.makegp_fourier(psr, signals.turnover_psd('chrom', turnover), components=psr_components, T=psr_Tspan, fourierbasis=signals.fourierbasis_chrom, name='chrom_gp', alpha=chrom_alpha, fref=chrom_fref))
     if chrom and chrom_poly:
-        gp_signals.append(signals.makegp_chrom_poly_svd(psr, name='chrom_gp', project=fd_gp))
+        gp_signals.append(signals.makegp_chrom_poly_svd(
+            psr, name='chrom_gp', project=fd_gp,
+            noisedict=mpta._chrom_poly_noisedict(psr, chrom_alpha)))
     if sw and not sw_powerlaw:
         gp_signals.append(solar.makegp_timedomain_solar_dm(psr, covariance=signals.squared_exponential, dt=SW_DT, name='sw_gp'))
     if sw and sw_powerlaw:
@@ -834,6 +838,7 @@ def make_psr_gps_fftint(
     dm=True,
     chrom=True,
     chrom_alpha=None,
+    chrom_fref=1400.0,
     chrom_poly=False,
     sw=True,
     sw_powerlaw=False,
@@ -864,9 +869,11 @@ def make_psr_gps_fftint(
     if dm:
         gp_signals.append(signals.makegp_fftcov_dm(psr, signals.turnover_psd('dm', turnover), components=psr_knots, T=psr_Tspan, name='dm_gp'))
     if chrom:
-        gp_signals.append(signals.makegp_fftcov_chrom(psr, signals.turnover_psd('chrom', turnover), components=psr_knots, T=psr_Tspan, name='chrom_gp', alpha=chrom_alpha))
+        gp_signals.append(signals.makegp_fftcov_chrom(psr, signals.turnover_psd('chrom', turnover), components=psr_knots, T=psr_Tspan, name='chrom_gp', alpha=chrom_alpha, fref=chrom_fref))
     if chrom and chrom_poly:
-        gp_signals.append(signals.makegp_chrom_poly_svd(psr, name='chrom_gp', project=fd_gp))
+        gp_signals.append(signals.makegp_chrom_poly_svd(
+            psr, name='chrom_gp', project=fd_gp,
+            noisedict=mpta._chrom_poly_noisedict(psr, chrom_alpha)))
     if sw and not sw_powerlaw:
         gp_signals.append(solar.makegp_timedomain_solar_dm(psr, covariance=signals.squared_exponential, dt=SW_DT, name='sw_gp'))
     if sw and sw_powerlaw:
@@ -898,6 +905,7 @@ def single_pulsar_noise(
     dm=True,
     chrom=True,
     chrom_alpha=None,
+    chrom_fref=1400.0,
     chrom_poly=True,
     fd=False,
     fd_nodes=16,
@@ -1051,8 +1059,9 @@ def single_pulsar_noise(
             project=fd_gp if (pa_project_fd and fd_gp is not None) else None)]
 
     if chrom and chrom_poly:
-        ppta_gps += [signals.makegp_chrom_poly_svd(psr, name='chrom_gp',
-                                                   project=fd_gp)]
+        ppta_gps += [signals.makegp_chrom_poly_svd(
+            psr, name='chrom_gp', project=fd_gp,
+            noisedict=mpta._chrom_poly_noisedict(psr, chrom_alpha))]
 
     ppta_gps += make_psr_delays(psr, config=config, mean_sw=mean_sw,
                                 chrom_exp=chrom_exp,
@@ -1095,7 +1104,8 @@ def single_pulsar_noise(
     gp_kwargs = dict(max_cadence_days=max_cadence_days,
                      bkgrnd_log10_A=bkgrnd_log10_A, Tspan=Tspan,
                      background=background, red=red, red2=red2, dm=dm,
-                     chrom=chrom, chrom_alpha=chrom_alpha, chrom_poly=False,
+                     chrom=chrom, chrom_alpha=chrom_alpha, chrom_fref=chrom_fref,
+                     chrom_poly=False,
                      sw=(sw and sw_powerlaw), sw_powerlaw=sw_powerlaw,
                      band=band, band_alpha=band_alpha, turnover=turnover, fd_gp=None)
     if fftint:
@@ -1126,13 +1136,262 @@ def single_pulsar_noise(
     return model
 
 
-def common_noise(psrs, chain_dfs, **kwargs):
-    """PPTA common-noise likelihood.
+def detect_ppta_components(psrname, columns):
+    """Per-pulsar PPTA components a stage-1 chain carries, from its column names.
 
-    Wraps :func:`mpta.common_noise`, which rebuilds per-pulsar models from the
-    chain columns. The PPTA group noise and ECORR stack are not reinstated.
+    The ECORR stack is Legendre on the 'global' block and plain per system.
+    ecorr_nmodes is None where the chain carries no global block.
+
+    psrname: pulsar name, the prefix of every per-pulsar column
+    columns: the chain's column names
     """
-    update_priordict_standard_ppta()
+    columns = list(columns)
+    has = lambda s: any(s in col for col in columns)
 
-    # install_priors=False: otherwise mpta.common_noise reinstalls the MPTA boxes.
-    return mpta.common_noise(psrs, chain_dfs, install_priors=False, **kwargs)
+    kidxs = [int(col.rsplit('_k', 1)[-1]) for col in columns
+             if 'log10_ecorr_k' in col and col.rsplit('_k', 1)[-1].isdigit()]
+    nmodes = ((max(kidxs) + 1 if kidxs else 1)
+              if has(f'{psrname}_global_log10_ecorr') else None)
+
+    backends = sorted({col[len(psrname) + 1:].rsplit('_log10_ecorr', 1)[0]
+                       for col in columns
+                       if col.startswith(psrname + '_')
+                       and (col.endswith('_log10_ecorr') or '_log10_ecorr_k' in col)}
+                      - {'global'})
+
+    groups = sorted({col.split('_group_noise_', 1)[1].rsplit('_log10_A', 1)[0]
+                     for col in columns
+                     if '_group_noise_' in col and col.endswith('_log10_A')})
+
+    return {
+        'ecorr': has('log10_ecorr'),
+        'ecorr_nmodes': nmodes,
+        'ecorr_correlated': has('ecorr_corr_k'),
+        'ecorr_per_backend': bool(backends),
+        'ecorr_dict': {psrname: backends} if backends else None,
+        'groups': groups,
+        'group_dict': {psrname: groups} if groups else None,
+        'sw': has('sw_gp'),
+        'sw_powerlaw': has('sw_gp_log10_A') or has('sw_gp_gamma'),
+        'sw_kernel': 'qp' if (has('sw_gp_log10_Gamma') or has('sw_gp_log10_p')) else 'se',
+        'mean_sw': has('n_earth'),
+        'turnover': tuple(c for c, n in signals.TURNOVER_COMPONENTS.items()
+                          if has(f'{n}_log10_fc')),
+    }
+
+
+def common_noise(psrs, chain_dfs, fftint=True, max_cadence_days=30, Tspan=None,
+                 chrom_poly=True, fix_chrom_alpha=True, chrom_fref=1400.0,
+                 noise_point='median',
+                 hd=False, hd_fixed_gamma=False, hd_components=None,
+                 fd=False, fd_nodes=16, fd_spacing='quantile', fd_selection=None,
+                 fd_groups=None, fd_prior='improper',
+                 pa_bin_flag='chan', pa_project_fd=True,
+                 white_selection=None,
+                 curn_per_pulsar=False, red2=False,
+                 freespec=False, freespec_components=30, red_fixed_dict=None,
+                 group_tspan='backend', sw_elat_max=SW_ELAT_MAX, mean_sw=False,
+                 use_phys_ephem=False, phys_ephem_partials=phys_ephem_mod.DEFAULT_PARTIALS,
+                 phys_ephem_inc_jupiter=True, phys_ephem_inc_saturn=True,
+                 phys_ephem_inc_masses=True, phys_ephem_frame_3axis=True,
+                 phys_ephem_inc_frame_drift=True, phys_ephem_inc_mainbelt=True,
+                 phys_ephem_inc_minorbody=True, phys_ephem_orthogonalize_minorbody=False,
+                 phys_ephem_inc_jerk=True, phys_ephem_mainbelt_prior_scale=1.0,
+                 phys_ephem_mainbelt_block="mass",
+                 phys_ephem_belt_eta_convention="none",
+                 phys_ephem_prior_units="edge", phys_ephem_minorbody_sigma=None,
+                 phys_ephem_mass_bodies=("jupiter", "saturn", "uranus", "neptune"),
+                 config=PPTA_CONFIG, use_commongp=False):
+    """PPTA common-noise likelihood, rebuilding each pulsar from its stage-1 chain.
+
+    Built on :func:`single_pulsar_noise`, so the ECORR stack, group noise, solar-wind
+    kernel and chromatic events are the PPTA ones. Components are switched on from the
+    chain columns; what leaves no parameter behind is an argument and must match the
+    stage-1 runs.
+
+    psrs:              pulsars
+    chain_dfs:         one stage-1 chain per pulsar, same order
+    fftint:            fftcov (time-domain) rather than Fourier bases
+    max_cadence_days:  sets the common and per-pulsar bin counts
+    Tspan:             array span; defaults to the span of psrs
+    chrom_poly:        marginalise the chromatic polynomial
+    fix_chrom_alpha:   hold chrom_gp_alpha at its stage-1 value
+    chrom_fref:        reference frequency in MHz for the chromatic basis, (fref/nu)**alpha
+    noise_point:       'median' or 'ml', the chain point the noise is fixed at
+    hd:                add a Hellings-Downs correlated process
+    hd_fixed_gamma:    fix its spectral index to 13/3
+    hd_components:     its Fourier bins; None ties them to max_cadence_days
+    fd, fd_*:          frequency-dependent delay; not auto-detected under the
+                       improper prior, so must match the stage-1 runs
+    pa_bin_flag:       bins for the parallactic-angle GP
+    pa_project_fd:     remove the fd span from that basis
+    white_selection:   flag or callable splitting efac and tnequad; must match the
+                       stage-1 runs, whose parameter names it sets
+    curn_per_pulsar:   give the common process per-pulsar parameters
+    red2:              force a second red power law in every pulsar
+    freespec:          free-spectrum CURN instead of the power law
+    red_fixed_dict:    {psrname: (log10_A, gamma)} fixing each pulsar's red noise
+    group_tspan:       span convention for the group-noise GPs
+    sw_elat_max:       ecliptic-latitude cut for the solar-wind GP
+    mean_sw:           add the deterministic mean solar-wind delay
+    use_phys_ephem:    add the common deterministic PEBBLE ephemeris delay
+    phys_ephem_partials: partials file
+    phys_ephem_inc_jupiter, phys_ephem_inc_saturn: sample that planet's orbital
+                       elements
+    phys_ephem_*:      the remaining PEBBLE switches, as in :func:`mpta.common_noise`
+    config:            PPTA configuration
+    use_commongp:      not implemented here; falls back to GlobalLikelihood
+    """
+    update_priordict_standard_ppta(config)
+
+    def has_param(df, s):
+        return any(s in col for col in df.columns)
+
+    if use_commongp:
+        print("Warning: use_commongp is not implemented for PPTA; the solar-wind GP is "
+              "sampled and per-pulsar, which forces the GlobalLikelihood path anyway.")
+
+    if fd:
+        print(f"fd=True ({fd_prior} prior): {fd_nodes} nodes, {fd_spacing} spacing. The "
+              f"node layout must match the stage-1 runs -- under the improper prior the "
+              f"amplitudes are marginalised and leave no parameters in the chains.")
+
+    _pa_psrs = [psr.name for psr, df in zip(psrs, chain_dfs)
+                if has_param(df, "pa_gp_log10_sigma")]
+    if _pa_psrs:
+        print(f"pa_gp: {len(_pa_psrs)} of {len(psrs)} pulsar(s), from the chains. Its "
+              f"basis is built with bin_flag={pa_bin_flag!r} and "
+              f"pa_project_fd={pa_project_fd}, which must match the stage-1 runs: "
+              f"neither leaves a parameter in the chains.")
+
+    if freespec:
+        prior.priordict_standard.update({r'curn_log10_rho\(([0-9]*)\)': [-9, -4],
+                                         'curn_log10_rho': [-9, -4]})
+    if use_phys_ephem:
+        prior.priordict_standard.update(phys_ephem_mod.phys_ephem_priordict())
+
+    if Tspan is None:
+        Tspan = signals.getspan(psrs)
+    common_components = int(Tspan / (max_cadence_days * 86400))
+    common_knots = 2 * common_components + 1
+    hd_nc = common_components if hd_components is None else int(hd_components)
+
+    psls = []
+    for psr, df in zip(psrs, chain_dfs):
+        if not any(psr.name in col for col in df.columns):
+            raise ValueError("Chain data frames do not match pulsar names")
+        noisedict = mpta.chain_point(df, psr.name, point=noise_point)
+
+        chrom_alpha = None
+        if fix_chrom_alpha:
+            chrom_alpha = noisedict.get(f"{psr.name}_chrom_gp_alpha", None)
+
+        det = detect_ppta_components(psr.name, df.columns)
+        ecorr_nmodes, ecorr_correlated = det['ecorr_nmodes'], det['ecorr_correlated']
+        ecorr_per_backend = det['ecorr_per_backend']
+        ecorr_dict = det['ecorr_dict']
+        groups, group_dict = det['groups'], det['group_dict']
+        sw_powerlaw, sw_kernel = det['sw_powerlaw'], det['sw_kernel']
+        turnover = det['turnover']
+
+        if freespec:
+            curn = signals.makegp_fourier(psr, signals.freespectrum, freespec_components, Tspan,
+                                          common=([] if curn_per_pulsar else ['curn_log10_rho']), name='curn')
+        elif not fftint:
+            curn = signals.makegp_fourier(psr, signals.powerlaw, common_components, Tspan,
+                                          common=([] if curn_per_pulsar else ['curn_log10_A', 'curn_gamma']), name='curn')
+        else:
+            curn = signals.makegp_fftcov(psr, signals.powerlaw, common_knots, Tspan,
+                                         common=([] if curn_per_pulsar else ['curn_log10_A', 'curn_gamma']), name='curn')
+        common_gps = curn if isinstance(curn, list) else [curn]
+
+        # The PEBBLE delay is deterministic and common: the same coefficient names
+        # appear in every pulsar, so they are shared.
+        pe_delays = []
+        if use_phys_ephem:
+            pe_delays = [phys_ephem_mod.makedelay_phys_ephem(
+                psr, phys_ephem_partials, inc_jupiter=phys_ephem_inc_jupiter,
+                inc_saturn=phys_ephem_inc_saturn, inc_masses=phys_ephem_inc_masses,
+                frame_drift_3axis=phys_ephem_frame_3axis,
+                inc_frame_drift=phys_ephem_inc_frame_drift,
+                inc_mainbelt=phys_ephem_inc_mainbelt,
+                inc_minorbody=phys_ephem_inc_minorbody,
+                orthogonalize_minorbody=phys_ephem_orthogonalize_minorbody,
+                inc_jerk=phys_ephem_inc_jerk,
+                mainbelt_prior_scale=phys_ephem_mainbelt_prior_scale,
+                mainbelt_block=phys_ephem_mainbelt_block,
+                belt_eta_convention=phys_ephem_belt_eta_convention,
+                prior_units=phys_ephem_prior_units,
+                minorbody_sigma=phys_ephem_minorbody_sigma,
+                mass_bodies=phys_ephem_mass_bodies)]
+
+        red_flag = has_param(df, "red_noise")
+        if red_fixed_dict is not None and psr.name in red_fixed_dict:
+            _la, _ga = red_fixed_dict[psr.name]
+            def _make_fixed_red(_la=_la, _ga=_ga):
+                def powerlaw_fixed(f, df):
+                    return signals.powerlaw(f, df, log10_A=_la, gamma=_ga)
+                return powerlaw_fixed
+            common_gps = common_gps + [signals.makegp_fourier(psr, _make_fixed_red(),
+                                                              common_components, Tspan,
+                                                              name='red_noise_fixed')]
+            red_flag = False
+
+        m = single_pulsar_noise(
+            psr, fftint=fftint, max_cadence_days=max_cadence_days, Tspan=Tspan,
+            noisedict=noisedict, background=False,
+            white_selection=white_selection,
+            ecorr=det['ecorr'], ecorr_nmodes=ecorr_nmodes,
+            ecorr_correlated=ecorr_correlated, ecorr_per_backend=ecorr_per_backend,
+            ecorr_dict=ecorr_dict,
+            red=red_flag, red2=(red2 or has_param(df, "red_noise2")),
+            dm=has_param(df, "dm_gp"), chrom=has_param(df, "chrom_gp"),
+            chrom_alpha=chrom_alpha, chrom_fref=chrom_fref,
+            chrom_poly=(chrom_poly and has_param(df, "chrom_gp")),
+            fd=fd, fd_nodes=fd_nodes, fd_spacing=fd_spacing, fd_selection=fd_selection,
+            fd_groups=fd_groups, fd_prior=fd_prior,
+            pa_gp=(psr.name in _pa_psrs), pa_bin_flag=pa_bin_flag,
+            pa_project_fd=pa_project_fd,
+            sw=det['sw'], sw_elat_max=sw_elat_max, sw_kernel=sw_kernel,
+            sw_powerlaw=sw_powerlaw, mean_sw=(mean_sw or det['mean_sw']),
+            band=False, band_alpha=False, turnover=turnover,
+            group=bool(groups), group_dict=group_dict, group_tspan=group_tspan,
+            chrom_exp=has_param(df, "chrom_exp"),
+            chrom_annual=has_param(df, "chrom_1yr"),
+            chrom_gauss=has_param(df, "chrom_gauss"),
+            chrom_gauss_20cm=has_param(df, "gauss_20cm"),
+            chrom_exponential=has_param(df, "chrom_exp"),
+            chrom_sphere=has_param(df, "chrom_sphere"),
+            chrom_step=has_param(df, "chrom_step"),
+            config=config, extra_gps=(common_gps + pe_delays))
+
+        _check_white_noise_names_match(psr, df, white_selection)
+        print("Including pulsar", psr.name, "with model parameters:\n", m.logL.params)
+        psls.append(m)
+
+    globalgp = None
+    if hd:
+        hd_spectrum = signals.powerlaw_gwb() if hd_fixed_gamma else signals.powerlaw
+        globalgp = signals.makeglobalgp_fourier(psrs, hd_spectrum, signals.hd_orf,
+                                                hd_nc, Tspan, name='gw')
+
+    return likelihood.GlobalLikelihood(psls, globalgp=globalgp)
+
+
+def _check_white_noise_names_match(psr, df, white_selection):
+    """Warn about stage-1 efac names this rebuild's white-noise split cannot produce."""
+    sel = (signals.selection_flags(white_selection)
+           if isinstance(white_selection, str) else white_selection)
+    labels = np.asarray(sel(psr) if sel is not None else psr.backend_flags)
+    expected = {f'{psr.name}_{lab}_efac' for lab in set(labels.tolist())}
+
+    orphans = sorted(c for c in df.columns
+                     if c.startswith(psr.name) and c.endswith('_efac')
+                     and c not in expected)
+    if orphans:
+        print(f"Warning: {psr.name}: the stage-1 chain carries {len(orphans)} efac "
+              f"parameter(s) this rebuild cannot produce, so their values are not "
+              f"applied and those parameters fall back on their priors: {orphans[:4]}"
+              f"{' ...' if len(orphans) > 4 else ''}. This rebuild splits the white "
+              f"noise as white_selection={white_selection!r}.")
+    return orphans
