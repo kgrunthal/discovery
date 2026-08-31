@@ -1163,8 +1163,23 @@ def detect_ppta_components(psrname, columns):
                      for col in columns
                      if '_group_noise_' in col and col.endswith('_log10_A')})
 
+    # The events in models_dict are indexed, {psr}_chrom_exp_{i}_*; the chrom_exponential
+    # switch adds ONE unindexed event beside them, so a substring test on 'chrom_exp'
+    # sets both and builds an event no chain provides. The other events are unindexed
+    # singletons.
+    pre = re.escape(psrname)
+    indexed_exp = any(re.match(rf'{pre}_chrom_exp_\d+_', c) for c in columns)
+    unindexed_exp = any(re.match(rf'{pre}_chrom_exp_(?!\d+_)', c) for c in columns)
+
     return {
         'ecorr': has('log10_ecorr'),
+        'chrom_exp': indexed_exp,
+        'chrom_exponential': unindexed_exp,
+        'chrom_annual': has('chrom_1yr'),
+        'chrom_gauss': has('chrom_gauss'),
+        'chrom_gauss_20cm': has('gauss_20cm'),
+        'chrom_sphere': has('chrom_sphere'),
+        'chrom_step': has('chrom_step'),
         'ecorr_nmodes': nmodes,
         'ecorr_correlated': has('ecorr_corr_k'),
         'ecorr_per_backend': bool(backends),
@@ -1356,13 +1371,13 @@ def common_noise(psrs, chain_dfs, fftint=True, max_cadence_days=30, Tspan=None,
             sw_powerlaw=sw_powerlaw, mean_sw=(mean_sw or det['mean_sw']),
             band=False, band_alpha=False, turnover=turnover,
             group=bool(groups), group_dict=group_dict, group_tspan=group_tspan,
-            chrom_exp=has_param(df, "chrom_exp"),
-            chrom_annual=has_param(df, "chrom_1yr"),
-            chrom_gauss=has_param(df, "chrom_gauss"),
-            chrom_gauss_20cm=has_param(df, "gauss_20cm"),
-            chrom_exponential=has_param(df, "chrom_exp"),
-            chrom_sphere=has_param(df, "chrom_sphere"),
-            chrom_step=has_param(df, "chrom_step"),
+            chrom_exp=det['chrom_exp'],
+            chrom_annual=det['chrom_annual'],
+            chrom_gauss=det['chrom_gauss'],
+            chrom_gauss_20cm=det['chrom_gauss_20cm'],
+            chrom_exponential=det['chrom_exponential'],
+            chrom_sphere=det['chrom_sphere'],
+            chrom_step=det['chrom_step'],
             config=config, extra_gps=(common_gps + pe_delays))
 
         _check_white_noise_names_match(psr, df, white_selection)

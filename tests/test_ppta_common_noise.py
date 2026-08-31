@@ -270,3 +270,37 @@ def test_chrom_fref_changes_the_chromatic_basis(ppta, psr):
     fb = [np.asarray(g.F) for g in b if getattr(g, 'gpname', None) == 'chrom_gp'][0]
     assert fa.shape == fb.shape
     assert not np.allclose(fa, fb)
+
+
+# --- chromatic events ----------------------------------------------------------------
+
+@pytest.mark.parametrize("cols_,exp,unlabelled", [
+    ([f'{PSR}_chrom_exp_1_alpha', f'{PSR}_chrom_exp_1_t0'], True, False),
+    ([f'{PSR}_chrom_exp_alpha', f'{PSR}_chrom_exp_t0'], False, True),
+    ([f'{PSR}_chrom_exp_1_t0', f'{PSR}_chrom_exp_t0'], True, True),
+    ([], False, False),
+])
+def test_an_indexed_event_does_not_switch_on_the_unlabelled_one(ppta, cols_, exp,
+                                                                unlabelled):
+    """models_dict events are {psr}_chrom_exp_{i}_*; chrom_exponential adds one
+    unindexed event beside them."""
+    d = ppta.detect_ppta_components(PSR, cols(PSR) + cols_)
+    assert d['chrom_exp'] is exp
+    assert d['chrom_exponential'] is unlabelled
+
+
+@pytest.mark.parametrize("name,key", [
+    ('chrom_1yr', 'chrom_annual'),
+    ('chrom_gauss', 'chrom_gauss'),
+    ('gauss_20cm', 'chrom_gauss_20cm'),
+    ('chrom_sphere', 'chrom_sphere'),
+    ('chrom_step', 'chrom_step'),
+])
+def test_the_unindexed_events_are_detected_by_name(ppta, name, key):
+    assert ppta.detect_ppta_components(PSR, cols(PSR) + [f'{PSR}_{name}_log10_Amp'])[key]
+    assert not ppta.detect_ppta_components(PSR, cols(PSR))[key]
+
+
+def test_a_20cm_event_is_not_read_as_a_gaussian_one(ppta):
+    d = ppta.detect_ppta_components(PSR, cols(PSR) + [f'{PSR}_gauss_20cm_t0'])
+    assert d['chrom_gauss_20cm'] and not d['chrom_gauss']
