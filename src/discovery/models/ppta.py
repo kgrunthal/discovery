@@ -463,7 +463,7 @@ def _set_chrom_exp_priors(psr, chrom_exponential=False, tau_min_days=10.0,
 
 
 def makegp_ecorr_ppta(psr, noisedict={}, nmodes=2, correlated=True,
-                      per_backend=True, ecorr_dict=None):
+                      per_backend=True, ecorr_dict=None, tobs_scale=False):
     """Global Legendre ECORR block plus per-backend white ECORR.
 
     Parameters
@@ -478,6 +478,10 @@ def makegp_ecorr_ppta(psr, noisedict={}, nmodes=2, correlated=True,
         to every backend.
     ecorr_dict : dict, optional
         ``{pulsar name: [backend flags]}``.
+    tobs_scale : bool
+        Weight the ECORR basis by ``sqrt(tobs_ref / tobs)``, making ``log10_ecorr``
+        the jitter at the reference integration time rather than an average over
+        integrations of unequal length.
     """
     gps = []
 
@@ -485,12 +489,13 @@ def makegp_ecorr_ppta(psr, noisedict={}, nmodes=2, correlated=True,
         maker = (signals.makegp_ecorr_legendre_correlated if correlated
                  else signals.makegp_ecorr_legendre)
         gps += [maker(psr, noisedict=noisedict, nmodes=nmodes,
-                      selection=selection_global, name='ecorrleg_global')]
+                      selection=selection_global, name='ecorrleg_global',
+                      tobs_scale=tobs_scale)]
 
     if per_backend:
         if ecorr_dict is None:
             gps += [signals.makegp_ecorr(psr, noisedict=noisedict,
-                                         name='ecorr_backend')]
+                                         name='ecorr_backend', tobs_scale=tobs_scale)]
         elif psr.name in ecorr_dict:
             masks = group_masks(psr, ecorr_dict[psr.name])
             if masks:
@@ -498,7 +503,7 @@ def makegp_ecorr_ppta(psr, noisedict={}, nmodes=2, correlated=True,
                 for b, m in masks.items():
                     labels = np.where(m, b, labels)
                 gps += [signals.makegp_ecorr(
-                    psr, noisedict=noisedict,
+                    psr, noisedict=noisedict, tobs_scale=tobs_scale,
                     selection=_make_selection(labels), name='ecorr_backend')]
 
     return gps
@@ -898,6 +903,7 @@ def single_pulsar_noise(
     ecorr_correlated=True,
     ecorr_per_backend=True,
     ecorr_dict=None,
+    ecorr_tobs_scale=False,
     background=True,
     bkgrnd_log10_A=None,
     red=True,
@@ -1029,7 +1035,8 @@ def single_pulsar_noise(
                                       nmodes=ecorr_nmodes,
                                       correlated=ecorr_correlated,
                                       per_backend=ecorr_per_backend,
-                                      ecorr_dict=(ecorr_dict or None))
+                                      ecorr_dict=(ecorr_dict or None),
+                                      tobs_scale=ecorr_tobs_scale)
 
     if sw and not sw_powerlaw:
         ppta_gps += makegp_solar_wind(psr, max_cadence_days=max_cadence_days,

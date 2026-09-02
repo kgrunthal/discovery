@@ -327,6 +327,53 @@ def quantize(toas, dt=1.0):
     return bins
 
 # no backends
+def ecorr_tobs_weights(psr, tobs_ref=1800.0):
+    """Per-TOA jitter weights ``sqrt(tobs_ref / tobs)``, for scaling an ECORR basis.
+
+    Jitter averages down over the pulses in an integration, so its amplitude goes as
+    1/sqrt(tobs) and a single ECORR over TOAs of unequal length is an average over
+    that. Weighting the basis rows makes ``log10_ecorr`` the jitter at ``tobs_ref``.
+
+    Raises if the flag is missing or non-positive, and warns if any integration is
+    shorter than a tenth of the median, which would carry more than three times the
+    typical weight.
+
+    psr:      Discovery Pulsar object, carrying a per-TOA 'tobs' flag in seconds
+    tobs_ref: reference integration time in seconds
+    """
+    if 'tobs' not in psr.flags:
+        raise KeyError(
+            f"ecorr_tobs_weights: {psr.name} has no 'tobs' flag, so the ECORR basis "
+            f"cannot be scaled by integration time; available flags are "
+            f"{sorted(psr.flags)}.")
+
+    tobs = np.asarray(psr.flags['tobs'])
+    try:
+        tobs = tobs.astype(np.float64)
+    except ValueError:
+        raise ValueError(f"ecorr_tobs_weights: {psr.name} has non-numeric 'tobs' values.")
+
+    bad = ~np.isfinite(tobs) | (tobs <= 0.0)
+    if bad.any():
+        raise ValueError(
+            f"ecorr_tobs_weights: {psr.name} has {int(bad.sum())} TOA(s) with a "
+            f"non-positive or non-finite 'tobs'. Scaling by integration time would "
+            f"give them an infinite weight, so fix the flag.")
+
+    if tobs_ref <= 0.0:
+        raise ValueError(f'ecorr_tobs_weights: tobs_ref must be positive, got {tobs_ref}.')
+
+    median = float(np.median(tobs))
+    short = tobs < 0.1 * median
+    if short.any():
+        print(f"Warning: ecorr_tobs_weights: {psr.name} has {int(short.sum())} TOA(s) "
+              f"with tobs below a tenth of the median {median:.0f} s (shortest "
+              f"{tobs.min():.0f} s), which take {np.sqrt(median / tobs.min()):.1f}x the "
+              f"typical weight.")
+
+    return np.sqrt(tobs_ref / tobs)
+
+
 def makegp_ecorr_simple(psr, noisedict={}):
     log10_ecorr = f'{psr.name}_log10_ecorr'
     params = [log10_ecorr]
@@ -348,7 +395,8 @@ def makegp_ecorr_simple(psr, noisedict={}):
         return matrix.VariableGP(matrix.NoiseMatrix1D_var(getphi), Umat)
 
 # nanograv backends
-def makegp_ecorr(psr, noisedict={}, enterprise=False, scale=1.0, selection=selection_backend_flags, variable=False, name='ecorrGP'):
+def makegp_ecorr(psr, noisedict={}, enterprise=False, scale=1.0, selection=selection_backend_flags, variable=False, name='ecorrGP',
+                 tobs_scale=False, tobs_ref=1800.0):
     log10_ecorrs, Umats = [], []
 
     backend_flags = selection(psr)
@@ -387,6 +435,8 @@ def makegp_ecorr(psr, noisedict={}, enterprise=False, scale=1.0, selection=selec
         else:
             Umats.append(np.vstack([bins == i for i in range(first_valid_bin, bins.max() + 1)]).T)
     Umatall = np.hstack(Umats)
+    if tobs_scale:
+        Umatall = Umatall * ecorr_tobs_weights(psr, tobs_ref)[:, None]
     params = log10_ecorrs
 
     pmasks, cnt = [], 0
@@ -428,7 +478,8 @@ def makegp_ecorr(psr, noisedict={}, enterprise=False, scale=1.0, selection=selec
     
 def makegp_ecorr_legendre(psr, noisedict={}, enterprise=False, scale=1.0,
                           selection=selection_backend_flags, variable=False,
-                          nmodes=3, fref=None, name='ecorrGPleg'):
+                          nmodes=3, fref=None, name='ecorrGPleg',
+                          tobs_scale=False, tobs_ref=1800.0):
     """ECORR GP with a Legendre-polynomial frequency basis (``nmodes`` modes).
 
     Within each backend, TOA frequencies are mapped to a normalised log-frequency
@@ -514,6 +565,8 @@ def makegp_ecorr_legendre(psr, noisedict={}, enterprise=False, scale=1.0,
     # full basis, grouped by mode: [ mode0 columns | mode1 columns | ... ]
     U_per_mode = [np.hstack(blocks) for blocks in U_blocks_per_mode]
     Umatall = np.hstack(U_per_mode)
+    if tobs_scale:
+        Umatall = Umatall * ecorr_tobs_weights(psr, tobs_ref)[:, None]
 
     # build per-parameter masks selecting the corresponding columns of Umatall
     pmasks, params = [], []
@@ -563,7 +616,8 @@ def makegp_ecorr_legendre(psr, noisedict={}, enterprise=False, scale=1.0,
 
 def makegp_quadratic_ecorr_legendre(psr, noisedict={}, enterprise=False, scale=1.0,
                                     selection=selection_backend_flags, variable=False,
-                                    fref=None, name='quadecorrGPleg'):
+                                    fref=None, name='quadecorrGPleg',
+                                    tobs_scale=False, tobs_ref=1800.0):
     """Three-mode ECORR GP using a Legendre-polynomial frequency basis.
 
     Thin wrapper around :func:`makegp_ecorr_legendre` with ``nmodes=3`` (Legendre
@@ -572,12 +626,14 @@ def makegp_quadratic_ecorr_legendre(psr, noisedict={}, enterprise=False, scale=1
     """
     return makegp_ecorr_legendre(psr, noisedict=noisedict, enterprise=enterprise, scale=scale,
                                  selection=selection, variable=variable,
-                                 nmodes=3, fref=fref, name=name)
+                                 nmodes=3, fref=fref, name=name,
+                                 tobs_scale=tobs_scale, tobs_ref=tobs_ref)
 
 def makegp_ecorr_legendre_correlated(psr, noisedict={}, enterprise=False, scale=1.0,
                                      selection=selection_backend_flags, variable=False,
                                      nmodes=3, fref=None,
-                                     name='correcorrGPleg'):
+                                     name='correcorrGPleg',
+                                     tobs_scale=False, tobs_ref=1800.0):
     """ECORR GP with a *correlated* Legendre frequency basis (full mode covariance).
 
     Identical within-epoch basis to :func:`makegp_ecorr_legendre`, but the
@@ -676,6 +732,8 @@ def makegp_ecorr_legendre_correlated(psr, noisedict={}, enterprise=False, scale=
                                         for a in range(1, k) for b in range(a)})
 
     Umatall = np.hstack(U_backend)
+    if tobs_scale:
+        Umatall = Umatall * ecorr_tobs_weights(psr, tobs_ref)[:, None]
 
     params = []
     for amps in amp_params_per_backend:
