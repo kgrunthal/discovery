@@ -1762,6 +1762,21 @@ def makegp_chrom_poly_svd(psr, fref=None, constant=1e40, name='chrom_gp', projec
 
 # Fourier GP
 
+def psr_components(toas, dt=7.0, Tspan=None):
+    """Fourier bins a TOA series can resolve, from its block-to-block cadence.
+
+    TOAs within dt days count as one observing block; the median gap between
+    blocks sets the Nyquist period 2*gap, and the span divides by it.
+
+    toas : TOA times in seconds
+    Tspan : span in seconds the basis is built on; the TOA span if None
+    """
+    day = np.asarray(toas) / 86400.0
+    blocks = np.unique(np.floor((day - day.min()) / dt))
+    span = (day.max() - day.min()) if Tspan is None else Tspan / 86400.0
+    return max(1, round(span / (2 * np.median(np.diff(blocks)) * dt)))
+
+
 def getspan(psrs):
     if isinstance(psrs, Iterable):
         return max(psr.toas.max() for psr in psrs) - min(psr.toas.min() for psr in psrs)

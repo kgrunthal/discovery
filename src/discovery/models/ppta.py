@@ -802,7 +802,8 @@ def make_psr_gps_fourier(
     frequencies.
     """
     psr_Tspan = signals.getspan(psr) if Tspan is None else Tspan
-    psr_components = int(psr_Tspan / (max_cadence_days * 86400))
+    psr_components = (signals.psr_components(psr.toas, dt=7.0, Tspan=psr_Tspan) if max_cadence_days is None
+                      else int(psr_Tspan / (max_cadence_days * 86400)))
     _set_band_priors(psr, band=band, band_alpha=band_alpha)
     turnover = signals.turnover_set(turnover)
 
@@ -860,7 +861,8 @@ def make_psr_gps_fftint(
     ``2 * components + 1`` knots as psd2cov requires an odd count.
     """
     psr_Tspan = signals.getspan(psr) if Tspan is None else Tspan
-    psr_components = int(psr_Tspan / (max_cadence_days * 86400))
+    psr_components = (signals.psr_components(psr.toas, dt=7.0, Tspan=psr_Tspan) if max_cadence_days is None
+                      else int(psr_Tspan / (max_cadence_days * 86400)))
     psr_knots = 2 * psr_components + 1
     _set_band_priors(psr, band=band, band_alpha=band_alpha)
     turnover = signals.turnover_set(turnover)
@@ -1208,6 +1210,7 @@ def common_noise(psrs, chain_dfs, fftint=True, max_cadence_days=30, Tspan=None,
                  chrom_poly=True, fix_chrom_alpha=True, chrom_fref=1400.0,
                  noise_point='median',
                  hd=False, hd_fixed_gamma=False, hd_components=None,
+                 curn_components=None,  # CURN Fourier bins; None -> common_components (i.e. tied to max_cadence_days)
                  fd=False, fd_nodes=16, fd_spacing='quantile', fd_selection=None,
                  fd_groups=None, fd_prior='improper',
                  pa_bin_flag='chan', pa_project_fd=True,
@@ -1296,9 +1299,22 @@ def common_noise(psrs, chain_dfs, fftint=True, max_cadence_days=30, Tspan=None,
 
     if Tspan is None:
         Tspan = signals.getspan(psrs)
-    common_components = int(Tspan / (max_cadence_days * 86400))
+    # max_cadence_days=None takes the common count from the concatenated array TOAs.
+    if max_cadence_days is None:
+        common_components = signals.psr_components(np.concatenate([psr.toas for psr in psrs]), dt=7.0)
+        print(f'max_cadence_days=None: the common basis resolves {common_components} '
+              f'Fourier bins from the array cadence.')
+    else:
+        common_components = int(Tspan / (max_cadence_days * 86400))
     common_knots = 2 * common_components + 1
     hd_nc = common_components if hd_components is None else int(hd_components)
+    curn_nc = common_components if curn_components is None else int(curn_components)
+    curn_knots = 2 * curn_nc + 1
+    if curn_components is not None:
+        print(f"curn_components={curn_nc}: the CURN carries "
+              f"{curn_knots if fftint else curn_nc} "
+              f"{'knots' if fftint else 'Fourier bins'} rather than the "
+              f"{common_knots if fftint else common_components} that max_cadence_days gives.")
 
     psls = []
     for psr, df in zip(psrs, chain_dfs):
@@ -1322,10 +1338,10 @@ def common_noise(psrs, chain_dfs, fftint=True, max_cadence_days=30, Tspan=None,
             curn = signals.makegp_fourier(psr, signals.freespectrum, freespec_components, Tspan,
                                           common=([] if curn_per_pulsar else ['curn_log10_rho']), name='curn')
         elif not fftint:
-            curn = signals.makegp_fourier(psr, signals.powerlaw, common_components, Tspan,
+            curn = signals.makegp_fourier(psr, signals.powerlaw, curn_nc, Tspan,
                                           common=([] if curn_per_pulsar else ['curn_log10_A', 'curn_gamma']), name='curn')
         else:
-            curn = signals.makegp_fftcov(psr, signals.powerlaw, common_knots, Tspan,
+            curn = signals.makegp_fftcov(psr, signals.powerlaw, curn_knots, Tspan,
                                          common=([] if curn_per_pulsar else ['curn_log10_A', 'curn_gamma']), name='curn')
         common_gps = curn if isinstance(curn, list) else [curn]
 

@@ -316,7 +316,8 @@ def _chrom_poly_noisedict(psr, chrom_alpha):
 
 def make_psr_gps_fourier(psr, max_cadence_days=14, bkgrnd_log10_A=None, Tspan=None, background=True, red=True, red2=False, dm=True, chrom=True, chrom_alpha=None, chrom_fref=1400.0, chrom_poly=True, sw=True, sw_powerlaw=False, sw_qp=False, sw_logf=False, band=False, band_alpha=False, band_bw_min=20.0, turnover=None, fd_gp=None):
     psr_Tspan = signals.getspan(psr) if Tspan is None else Tspan
-    psr_components = int(psr_Tspan / (max_cadence_days * 86400))
+    psr_components = (signals.psr_components(psr.toas, dt=1.0, Tspan=psr_Tspan) if max_cadence_days is None
+                      else int(psr_Tspan / (max_cadence_days * 86400)))
     _set_band_priors(psr, band=band, band_alpha=band_alpha, bw_min_mhz=band_bw_min)
     turnover = signals.turnover_set(turnover)
 
@@ -335,7 +336,8 @@ def make_psr_gps_fourier(psr, max_cadence_days=14, bkgrnd_log10_A=None, Tspan=No
 
 def make_psr_gps_fftint(psr, max_cadence_days=14, bkgrnd_log10_A=None, Tspan=None, background=True, red=True, red2=False, dm=True, chrom=True, chrom_alpha=None, chrom_fref=1400.0, chrom_poly=True, sw=True, sw_powerlaw=False, sw_qp=False, band=False, band_alpha=False, band_bw_min=20.0, turnover=None, fd_gp=None):
     psr_Tspan = signals.getspan(psr) if Tspan is None else Tspan
-    psr_components = int(psr_Tspan / (max_cadence_days * 86400))
+    psr_components = (signals.psr_components(psr.toas, dt=1.0, Tspan=psr_Tspan) if max_cadence_days is None
+                      else int(psr_Tspan / (max_cadence_days * 86400)))
     psr_knots = 2 * psr_components + 1
     _set_band_priors(psr, band=band, band_alpha=band_alpha, bw_min_mhz=band_bw_min)
     turnover = signals.turnover_set(turnover)
@@ -485,6 +487,7 @@ def common_noise(psrs, chain_dfs, fftInt=True, max_cadence_days=14, Tspan=None,
                  psr_cadence_days=None,  # {psrname: cadence} overriding the PER-PULSAR GP cadence only; the common basis stays on max_cadence_days, since the common process is one signal sampled at the array's cadence
                  chrom_poly=True, fix_chrom_alpha=True, chrom_fref=1400.0, noise_point='median', hd=False, hd_fixed_gamma=False,
                  hd_components=None,  # HD Fourier bins; None -> common_components (i.e. tied to max_cadence_days)
+                 curn_components=None,  # CURN Fourier bins; None -> common_components (i.e. tied to max_cadence_days)
                  os_analysis=False,  # put the HD spectrum (gw_log10_A/gw_gamma) into a PER-PULSAR GP instead of a globalgp, so discovery.optimal.OS can see it. For OS runs only -- NOT for Bayesian sampling, which wants the correlated globalgp.
                  fd=False, fd_nodes=16, fd_spacing='quantile', fd_selection=None, fd_prior='improper', fd_kind='linear', fd_bin_flag=None,  # piecewise-linear frequency-dependent delay; nodes/spacing/selection MUST match the stage-1 runs, as they cannot be auto-detected (see below)
                  pa_bin_flag='chan', pa_project_fd=True,  # basis layout for the parallactic-angle GP, which is switched on per pulsar from the chains but whose bins and projection MUST match the stage-1 runs, as they cannot be auto-detected (see below)
@@ -636,11 +639,24 @@ def common_noise(psrs, chain_dfs, fftInt=True, max_cadence_days=14, Tspan=None,
                 f"the pulsars in this run. A misspelled name would otherwise leave that "
                 f"pulsar at the array cadence with nothing in the log to say so.")
 
-    common_components = int(Tspan / (max_cadence_days * 86400))
+    # max_cadence_days=None takes the common count from the concatenated array TOAs.
+    if max_cadence_days is None:
+        common_components = signals.psr_components(np.concatenate([psr.toas for psr in psrs]), dt=1.0)
+        print(f'max_cadence_days=None: the common basis resolves {common_components} '
+              f'Fourier bins from the array cadence.')
+    else:
+        common_components = int(Tspan / (max_cadence_days * 86400))
     common_knots = 2 * common_components + 1
     # Bin count for the HD process, shared by the globalgp and the os_analysis
     # per-pulsar GP so the two carry the same spectral parametrisation.
     hd_nc = common_components if hd_components is None else int(hd_components)
+    curn_nc = common_components if curn_components is None else int(curn_components)
+    curn_knots = 2 * curn_nc + 1
+    if curn_components is not None:
+        print(f"curn_components={curn_nc}: the CURN carries "
+              f"{curn_knots if fftInt else curn_nc} "
+              f"{'knots' if fftInt else 'Fourier bins'} rather than the "
+              f"{common_knots if fftInt else common_components} that max_cadence_days gives.")
 
     if os_analysis:
         print(f"os_analysis=True: the HD spectrum (gw_log10_A"
@@ -708,9 +724,9 @@ def common_noise(psrs, chain_dfs, fftInt=True, max_cadence_days=14, Tspan=None,
             # non-power-law common band power at 1.5-2.1 yr (Gate-2).
             curn = signals.makegp_fourier(psr, signals.freespectrum, freespec_components, Tspan, common=([] if curn_per_pulsar else ['curn_log10_rho']), name='curn')
         elif not fftInt:
-            curn = signals.makegp_fourier(psr, signals.powerlaw, common_components, Tspan, common=([] if curn_per_pulsar else ['curn_log10_A', 'curn_gamma']), name='curn')
+            curn = signals.makegp_fourier(psr, signals.powerlaw, curn_nc, Tspan, common=([] if curn_per_pulsar else ['curn_log10_A', 'curn_gamma']), name='curn')
         else:
-            curn = signals.makegp_fftcov(psr, signals.powerlaw, common_knots, Tspan, common=([] if curn_per_pulsar else ['curn_log10_A', 'curn_gamma']), name='curn')
+            curn = signals.makegp_fftcov(psr, signals.powerlaw, curn_knots, Tspan, common=([] if curn_per_pulsar else ['curn_log10_A', 'curn_gamma']), name='curn')
         # Sampled common GPs that are STACKABLE into the commongp (curn, red_fixed).
         common_gps = curn if isinstance(curn, list) else [curn]
 
