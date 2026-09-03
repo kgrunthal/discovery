@@ -7,7 +7,6 @@ import pytest
 
 import discovery as ds
 from discovery import signals as s
-from discovery.models import mpta, ppta
 
 
 DATA = Path(__file__).resolve().parent.parent / "data"
@@ -106,6 +105,7 @@ def test_the_reference_only_rescales_the_amplitude(psr):
 
 def test_mpta_threads_the_switch_and_defaults_it_off(psr):
     import inspect
+    from discovery.models import mpta
 
     sig = inspect.signature(mpta.single_pulsar_noise).parameters
     assert sig['ecorr_tobs_scale'].default is False
@@ -126,6 +126,7 @@ def test_mpta_threads_the_switch_and_defaults_it_off(psr):
 
 def test_ppta_threads_the_switch_and_defaults_it_off(psr):
     import inspect
+    from discovery.models import ppta
 
     assert inspect.signature(ppta.single_pulsar_noise).parameters[
         'ecorr_tobs_scale'].default is False

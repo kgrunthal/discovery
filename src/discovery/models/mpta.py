@@ -51,7 +51,10 @@ def update_priordict_standard_mpta():
         # sigma : rms electron density variability (cm^-3)
         # ell   : correlation timescale (days)
         '(.*_)?sw_gp_log10_sigma':  [ -2,  1.3],   # 0.01 - 20 cm^-3
-        '(.*_)?sw_gp_log10_ell':    [  1,  4],   # 10 days - ~30 yr
+        # 10 days to the 6.33 yr MPTA array span. Above the span the kernel is flat
+        # across the data and phi tends to rank one. One box for every pulsar: 82 of the
+        # 83 span within 0.01 dex of the array. Recompute for a different span.
+        '(.*_)?sw_gp_log10_ell':    [  1,  3.36],
         # QP kernel adds:
         '(.*_)?sw_gp_log10_Gamma':  [ -3,  2],   # dimensionless
         '(.*_)?sw_gp_log10_p':      [ -2,  1.3],   # years (0.01 - 20 yr)

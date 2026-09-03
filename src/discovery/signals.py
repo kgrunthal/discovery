@@ -2940,7 +2940,9 @@ def makegp_fftcov_orbital_dm(psr, prior, components, order=1,
 #
 # Both kernels operate on tau given in SECONDS (matching psr.toas units),
 # while the kernel hyperparameters are in physically natural log10 units:
-#   log10_sigma  -- log10 of amplitude in seconds
+#   log10_sigma  -- log10 of amplitude, in the units of the GP coefficients: for
+#                   solar.makegp_timedomain_solar_dm the basis carries the delay per
+#                   unit density, so sigma is an electron density in cm^-3
 #   log10_ell    -- log10 of correlation timescale in DAYS
 #   log10_Gamma  -- log10 of periodicity weight (dimensionless, QP only)
 #   log10_p      -- log10 of period in YEARS (QP only)

@@ -102,7 +102,9 @@ PPTA_CONFIG = {
         # solar wind, quasi-periodic time-domain kernel. sigma is the rms
         # electron-density variability (cm^-3); ell and p are in days.
         '(.*_)?sw_gp_log10_sigma': [-2, 1.3],
-        '(.*_)?sw_gp_log10_ell': [1, 4],
+        # 10 days to the 20.96 yr PPTA array span; above the span the kernel is flat
+        # across the data and phi tends to rank one. Recompute for a different span.
+        '(.*_)?sw_gp_log10_ell': [1, 3.88],
         '(.*_)?sw_gp_log10_Gamma': [-3, 2],
         '(.*_)?sw_gp_log10_p': [-2, 1.3],   # years (0.01 - 20 yr), as scaled in signals.quasi_periodic
         # Fourier power-law solar-wind GP, used when sw_powerlaw=True.
