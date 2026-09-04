@@ -538,9 +538,12 @@ def makegp_group_noise(psr, group_dict=None, max_cadence_days=30.0, Tspan=None,
     gps = []
     for g, mask in group_masks(psr, groups).items():
         ntoa = int(mask.sum())
-        T = psr_Tspan if use_psr_span else float(psr.toas[mask].max()
-                                                 - psr.toas[mask].min())
-        ncomp = min(int(T / (max_cadence_days * 86400.0)),
+        group_toas = psr.toas[mask]
+        T = psr_Tspan if use_psr_span else float(group_toas.max()
+                                                 - group_toas.min())
+        ncomp = min(signals.psr_components(group_toas, dt=7.0, Tspan=T)
+                    if max_cadence_days is None
+                    else int(T / (max_cadence_days * 86400.0)),
                     max(1, ntoa // GROUP_TOA_PER_MODE))
         if ncomp < 1:
             print(f'Warning: group {g!r} for {psr.name} has {ntoa} TOAs over '
@@ -593,7 +596,9 @@ def makegp_group_noise_fftcov(psr, group_dict=None, max_cadence_days=30.0,
         group_toas = psr.toas[mask]
         T = psr_Tspan if use_psr_span else float(group_toas.max()
                                                  - group_toas.min())
-        ncomp = min(int(T / (max_cadence_days * 86400.0)),
+        ncomp = min(signals.psr_components(group_toas, dt=7.0, Tspan=T)
+                    if max_cadence_days is None
+                    else int(T / (max_cadence_days * 86400.0)),
                     max(1, ntoa // GROUP_TOA_PER_MODE))
         if ncomp < 1:
             print(f'Warning: group {g!r} for {psr.name} has {ntoa} TOAs over '
@@ -797,7 +802,8 @@ def make_psr_gps_fourier(
 ):
     """Per-pulsar power-law GPs on a Fourier basis.
 
-    Component count is ``int(T / max_cadence_days)``. ``sw_powerlaw`` selects the
+    Component count is ``int(T / max_cadence_days)``, or resolved from the TOAs
+    when ``max_cadence_days`` is None. ``sw_powerlaw`` selects the
     Fourier solar-wind GP over the time-domain one; ``sw_logf`` log-spaces its
     frequencies.
     """

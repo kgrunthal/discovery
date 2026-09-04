@@ -1773,8 +1773,9 @@ def psr_components(toas, dt=7.0, Tspan=None):
     """
     day = np.asarray(toas) / 86400.0
     blocks = np.unique(np.floor((day - day.min()) / dt))
+    gaps = np.diff(blocks)
     span = (day.max() - day.min()) if Tspan is None else Tspan / 86400.0
-    return max(1, round(span / (2 * np.median(np.diff(blocks)) * dt)))
+    return max(1, round(span / (2 * (np.median(gaps) if gaps.size else 1.0) * dt)))
 
 
 def getspan(psrs):
