@@ -359,7 +359,7 @@ def single_pulsar_noise(psr, fftint=True, max_cadence_days=14, Tspan=None, noise
                         white_selection=None, # per-TOA flag whose values split efac and tnequad, e.g. 'chan' for one pair per frequency channel. ECORR is deliberately NOT split: each epoch-channel is a singleton, so a per-channel ECORR would give one basis column per TOA
                         ecorr=True, quadratic=False, ecorr_nmodes=None, ecorr_correlated=False, global_ecorr=False, ecorr_tobs_scale=False, # ecorr options. ecorr_tobs_scale weights the ECORR basis by sqrt(tobs_ref/tobs), making log10_ecorr the jitter at the reference integration time rather than an average over integrations of unequal length. ecorr_nmodes=N selects an N-mode Legendre ECORR (log-frequency basis; nmodes=1 is standard ECORR); ecorr_correlated=True uses the full-M (correlated-mode) variant that can also model a frequency-asymmetric jitter amplitude
                         background=True, bkgrnd_log10_A=None, red=True, red2=False, dm=True, chrom=True, chrom_alpha=None, chrom_fref=1400.0, chrom_poly=True, sw=True, sw_powerlaw=False, sw_qp=False, sw_logf=False, turnover=None, # Base model: gwb, red, dm, chromatic, solar wind (sw_powerlaw=True selects the legacy power-law solar-wind GP instead of the time-domain one; sw_logf=True log-spaces its frequencies -- Fourier path only)
-                        band=False, band_alpha=False, band_bw_min=20.0, fd=False, fd_nodes=16, fd_spacing='quantile', fd_selection=None, fd_prior='improper', fd_kind='linear', fd_bin_flag=None, # Additional GP models (fd=True marginalises an arbitrary time-constant frequency-dependent delay over fd_nodes frequency nodes; fd_selection splits it per TOA group; fd_prior selects the improper or the Matern-3/2 prior over the node amplitudes)
+                        band=False, band_alpha=False, band_bw_min=20.0, fd=False, fd_nodes=16, fd_spacing='quantile', fd_selection=None, fd_prior='improper', fd_kind='linear', fd_bin_flag=None, fd_normalise=False, # Additional GP models (fd=True marginalises an arbitrary time-constant frequency-dependent delay over fd_nodes frequency nodes; fd_selection splits it per TOA group; fd_prior selects the improper or the Matern-3/2 prior over the node amplitudes)
                         pa_gp=False, pa_bin_flag='chan', pa_project_fd=True, # Delay locked to twice the parallactic angle, with a free amplitude and phase per frequency channel; pa_project_fd removes the fd column span from the basis
                         chrom_annual=False, chrom_exponential=False, chrom_gaussian=False, chrom_sphere=False, chrom_step=False, # Deterministic chromatic models
                         shapiro=False, orbital_dm=False, extra_gps=None, # Shapiro delay and orbital DM, and extra GPs
@@ -440,7 +440,8 @@ def single_pulsar_noise(psr, fftint=True, max_cadence_days=14, Tspan=None, noise
     elif fd_prior == 'matern':
         fd_gp = signals.makegp_fd_piecewise_matern(psr, nodes=fd_nodes, spacing=fd_spacing,
                                                    selection=fd_selection, name='fd_gp',
-                                                   kind=fd_kind, bin_flag=fd_bin_flag)
+                                                   kind=fd_kind, bin_flag=fd_bin_flag,
+                                                   normalise=fd_normalise)
     elif fd_prior == 'improper':
         fd_gp = signals.makegp_fd_piecewise(psr, nodes=fd_nodes, spacing=fd_spacing,
                                             selection=fd_selection, name='fd',
@@ -489,7 +490,7 @@ def common_noise(psrs, chain_dfs, fftInt=True, max_cadence_days=14, Tspan=None,
                  hd_components=None,  # HD Fourier bins; None -> common_components (i.e. tied to max_cadence_days)
                  curn_components=None,  # CURN Fourier bins; None -> common_components (i.e. tied to max_cadence_days)
                  os_analysis=False,  # put the HD spectrum (gw_log10_A/gw_gamma) into a PER-PULSAR GP instead of a globalgp, so discovery.optimal.OS can see it. For OS runs only -- NOT for Bayesian sampling, which wants the correlated globalgp.
-                 fd=False, fd_nodes=16, fd_spacing='quantile', fd_selection=None, fd_prior='improper', fd_kind='linear', fd_bin_flag=None,  # piecewise-linear frequency-dependent delay; nodes/spacing/selection MUST match the stage-1 runs, as they cannot be auto-detected (see below)
+                 fd=False, fd_nodes=16, fd_spacing='quantile', fd_selection=None, fd_prior='improper', fd_kind='linear', fd_bin_flag=None, fd_normalise=False,  # piecewise-linear frequency-dependent delay; nodes/spacing/selection MUST match the stage-1 runs, as they cannot be auto-detected (see below)
                  pa_bin_flag='chan', pa_project_fd=True,  # basis layout for the parallactic-angle GP, which is switched on per pulsar from the chains but whose bins and projection MUST match the stage-1 runs, as they cannot be auto-detected (see below)
                  use_commongp=False,
                  curn_per_pulsar=False,  # give the common process PER-PULSAR (log10_A, gamma), or per-bin log10_rho under freespec, instead of parameters shared across the array
@@ -809,7 +810,7 @@ def common_noise(psrs, chain_dfs, fftInt=True, max_cadence_days=14, Tspan=None,
                                        red=False, red2=False, dm=False, chrom=False, chrom_alpha=chrom_alpha, chrom_fref=chrom_fref, chrom_poly=(chrom_poly and has_param(df, "chrom_gp")), sw=False, sw_powerlaw=sw_powerlaw, sw_qp=sw_qp, turnover=turnover,
                                        band=False, band_alpha=False,
                                        chrom_annual=has_param(df, "chrom_1yr"), chrom_exponential=has_param(df, "chrom_exp"), chrom_gaussian=has_param(df, "chrom_gauss"), chrom_sphere=has_param(df, "chrom_sphere"), chrom_step=has_param(df, "chrom_step"),
-                                       fd=fd, fd_nodes=fd_nodes, fd_spacing=fd_spacing, fd_selection=fd_selection, fd_prior=fd_prior, fd_kind=fd_kind, fd_bin_flag=fd_bin_flag,
+                                       fd=fd, fd_nodes=fd_nodes, fd_spacing=fd_spacing, fd_selection=fd_selection, fd_prior=fd_prior, fd_kind=fd_kind, fd_bin_flag=fd_bin_flag, fd_normalise=fd_normalise,
                                        pa_gp=(psr.name in _pa_psrs), pa_bin_flag=pa_bin_flag, pa_project_fd=pa_project_fd,
                                        extra_gps=(sw_gps + pe_delays))
 
@@ -825,7 +826,7 @@ def common_noise(psrs, chain_dfs, fftInt=True, max_cadence_days=14, Tspan=None,
                                     dm=has_param(df, "dm_gp"), chrom=has_param(df, "chrom_gp"), chrom_alpha=chrom_alpha, chrom_fref=chrom_fref, chrom_poly=(chrom_poly and has_param(df, "chrom_gp")), sw=has_param(df, "sw_gp"), sw_powerlaw=sw_powerlaw, sw_qp=sw_qp, turnover=turnover,
                                     band=has_param(df, "band_gp"), band_alpha=has_param(df, "bandalpha_gp"),
                                     chrom_annual=has_param(df, "chrom_1yr"), chrom_exponential=has_param(df, "chrom_exp"), chrom_gaussian=has_param(df, "chrom_gauss"), chrom_sphere=has_param(df, "chrom_sphere"), chrom_step=has_param(df, "chrom_step"),
-                                    fd=fd, fd_nodes=fd_nodes, fd_spacing=fd_spacing, fd_selection=fd_selection, fd_prior=fd_prior, fd_kind=fd_kind, fd_bin_flag=fd_bin_flag,
+                                    fd=fd, fd_nodes=fd_nodes, fd_spacing=fd_spacing, fd_selection=fd_selection, fd_prior=fd_prior, fd_kind=fd_kind, fd_bin_flag=fd_bin_flag, fd_normalise=fd_normalise,
                                     pa_gp=(psr.name in _pa_psrs), pa_bin_flag=pa_bin_flag, pa_project_fd=pa_project_fd,
                                     extra_gps=(common_gps + pe_delays))
 

@@ -642,7 +642,7 @@ def makegp_solar_wind(psr, max_cadence_days=30.0, kernel='qp'):
 # ---------------------------------------------------------------------------
 
 def makegp_fd(psr, nodes=16, spacing='quantile', selection=None, groups=None,
-              fd_groups_dict=None, prior='improper'):
+              fd_groups_dict=None, prior='improper', normalise=False):
     """Marginalised piecewise-linear frequency-dependent delay.
 
     Returns a single GP, or ``None`` if the basis would be empty.
@@ -678,7 +678,7 @@ def makegp_fd(psr, nodes=16, spacing='quantile', selection=None, groups=None,
     if prior == 'matern':
         return signals.makegp_fd_piecewise_matern(psr, nodes=nodes, spacing=spacing,
                                                   selection=selection, groups=groups,
-                                                  name='fd_gp')
+                                                  name='fd_gp', normalise=normalise)
     if prior != 'improper':
         raise ValueError(f"makegp_fd: prior must be 'improper' or 'matern', got {prior!r}.")
 
@@ -929,6 +929,7 @@ def single_pulsar_noise(
     fd_selection=None,
     fd_groups=None,
     fd_prior='improper',
+    fd_normalise=False,
     # Delay locked to twice the parallactic angle, with a free amplitude and phase per
     # frequency channel.
     pa_gp=False,
@@ -1065,7 +1066,8 @@ def single_pulsar_noise(
     if fd:
         fd_gp = makegp_fd(psr, nodes=fd_nodes, spacing=fd_spacing,
                           selection=fd_selection, groups=fd_groups,
-                          fd_groups_dict=md.get("fd_groups"), prior=fd_prior)
+                          fd_groups_dict=md.get("fd_groups"), prior=fd_prior,
+                          normalise=fd_normalise)
         if fd_gp is not None:
             ppta_gps += [fd_gp]
 
@@ -1218,7 +1220,7 @@ def common_noise(psrs, chain_dfs, fftint=True, max_cadence_days=30, Tspan=None,
                  hd=False, hd_fixed_gamma=False, hd_components=None,
                  curn_components=None,  # CURN Fourier bins; None -> common_components (i.e. tied to max_cadence_days)
                  fd=False, fd_nodes=16, fd_spacing='quantile', fd_selection=None,
-                 fd_groups=None, fd_prior='improper',
+                 fd_groups=None, fd_prior='improper', fd_normalise=False,
                  pa_bin_flag='chan', pa_project_fd=True,
                  white_selection=None,
                  curn_per_pulsar=False, red2=False,
@@ -1395,7 +1397,7 @@ def common_noise(psrs, chain_dfs, fftint=True, max_cadence_days=30, Tspan=None,
             chrom_alpha=chrom_alpha, chrom_fref=chrom_fref,
             chrom_poly=(chrom_poly and has_param(df, "chrom_gp")),
             fd=fd, fd_nodes=fd_nodes, fd_spacing=fd_spacing, fd_selection=fd_selection,
-            fd_groups=fd_groups, fd_prior=fd_prior,
+            fd_groups=fd_groups, fd_prior=fd_prior, fd_normalise=fd_normalise,
             pa_gp=(psr.name in _pa_psrs), pa_bin_flag=pa_bin_flag,
             pa_project_fd=pa_project_fd,
             sw=det['sw'], sw_elat_max=sw_elat_max, sw_kernel=sw_kernel,

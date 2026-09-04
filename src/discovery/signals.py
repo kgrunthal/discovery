@@ -1126,7 +1126,7 @@ _SQRT3 = float(np.sqrt(3.0))
 
 def makegp_fd_piecewise_matern(psr, nodes=16, spacing='quantile', selection=None, groups=None,
                                project_tm=True, jitter=1e-8, name='fd_gp',
-                               kind='linear', bin_flag=None):
+                               kind='linear', bin_flag=None, normalise=False):
     """Piecewise-linear frequency-dependent delay under a Matern-3/2 prior.
 
     Same hat-function basis as :func:`makegp_fd_piecewise`, but the node
@@ -1156,6 +1156,10 @@ def makegp_fd_piecewise_matern(psr, nodes=16, spacing='quantile', selection=None
     selection:  callable, or list of callables, splitting the TOAs into blocks
     groups:     labels that get their own block alongside a global one
     project_tm: project the timing-model column subspace out of the basis
+    normalise:  scale Phi so log10_sigma is the rms delay per TOA that the prior
+                admits after the timing-model projection, rather than the node
+                amplitude. Without it sigma absorbs the ell dependence of that
+                projection and the two are degenerate
     jitter:     relative diagonal added to Phi, capping its condition number near
                 nodes/jitter
     name:       parameter-name stem
@@ -1205,20 +1209,39 @@ def makegp_fd_piecewise_matern(psr, nodes=16, spacing='quantile', selection=None
     signame, ellname = f'{psr.name}_{name}_log10_sigma', f'{psr.name}_{name}_log10_ell'
     sizes = [len(q) for q in qs]
 
-    def _makeblock(q, n):
-        dist = matrix.jnparray(np.abs(q[:, None] - q[None, :]))
-        eye = matrix.jnparray(np.eye(n))
+    offsets = np.cumsum([0] + sizes)
+    total = int(offsets[-1])
 
+    dists = [matrix.jnparray(np.abs(q[:, None] - q[None, :])) for q in qs]
+    eyes = [matrix.jnparray(np.eye(n)) for n in sizes]
+
+    def _corr(dist, eye, params):
+        r = _SQRT3 * dist / (10.0 ** params[ellname])
+        return (1.0 + r) * jnp.exp(-r) + jitter * eye
+
+    if normalise:
+        # trace(F K F^T) = sum(G * K), with G the Gram of the basis the GP ships,
+        # so the per-TOA mean square costs one nodes x nodes product per call
+        grams = [matrix.jnparray(fmat[:, i0:i0+n].T @ fmat[:, i0:i0+n])
+                 for i0, n in zip(offsets[:-1], sizes)]
+        ntoa = fmat.shape[0]
+
+        def _amp(params):
+            g = sum(jnp.sum(G * _corr(dist, eye, params))
+                    for G, dist, eye in zip(grams, dists, eyes)) / ntoa
+            return 10.0 ** (2.0 * params[signame]) / g
+    else:
+        def _amp(params):
+            return 10.0 ** (2.0 * params[signame])
+
+    def _makeblock(dist, eye):
         def getblock(params):
-            r = _SQRT3 * dist / (10.0 ** params[ellname])
-            return 10.0 ** (2.0 * params[signame]) * ((1.0 + r) * jnp.exp(-r) + jitter * eye)
+            return _amp(params) * _corr(dist, eye, params)
         getblock.params = [signame, ellname]
 
         return getblock
 
-    blockfuncs = [_makeblock(q, n) for q, n in zip(qs, sizes)]
-    offsets = np.cumsum([0] + sizes)
-    total = int(offsets[-1])
+    blockfuncs = [_makeblock(dist, eye) for dist, eye in zip(dists, eyes)]
 
     def getphi(params):
         phi = jnp.zeros((total, total))
