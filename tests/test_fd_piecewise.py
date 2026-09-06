@@ -657,3 +657,88 @@ def test_selection_flags_splits_the_white_noise(psr):
 
     assert len(pars) == 2 * len(labels)
     assert all(any(lab in p for lab in labels) for p in pars)
+
+
+def test_edge_spacing_puts_one_node_between_each_pair_of_bins(psr):
+    """Nodes are the bin boundaries plus the two band ends, so bins + 1 of them."""
+    gp = s.makegp_fd_piecewise(psr, spacing='edge', bin_flag='fe')
+    nbin = len(set(np.asarray(psr.flags['fe']).astype(str).tolist()))
+    assert len(gp.fd_nodes) == nbin + 1
+
+
+def test_edge_nodes_sit_at_the_geometric_midpoints_of_the_bin_means(psr):
+    """The interior nodes sit in the gaps between bins, not at the bin centres."""
+    x = np.log(np.asarray(psr.freqs))
+    lab = np.asarray(psr.flags['fe']).astype(str)
+    st = np.array(sorted((x[lab == v].mean(), x[lab == v].min(), x[lab == v].max())
+                         for v in set(lab.tolist())))
+    want = np.exp(0.5 * (st[:-1, 2] + st[1:, 1]))
+
+    gp = s.makegp_fd_piecewise(psr, spacing='edge', bin_flag='fe')
+    assert np.allclose(gp.fd_nodes[1:-1], want, rtol=1e-12)
+    assert np.isclose(gp.fd_nodes[0], np.min(psr.freqs), rtol=1e-12)
+    assert np.isclose(gp.fd_nodes[-1], np.max(psr.freqs), rtol=1e-12)
+
+
+def test_edge_spacing_gives_each_segment_a_single_bin(psr):
+    """The point of the option: no segment straddles a bin boundary."""
+    x = np.log(np.asarray(psr.freqs))
+    lab = np.asarray(psr.flags['fe']).astype(str)
+    gp = s.makegp_fd_piecewise(psr, spacing='edge', bin_flag='fe')
+    q = np.log(gp.fd_nodes)
+
+    seg = np.clip(np.searchsorted(q, x, side='right') - 1, 0, len(q) - 2)
+    assert all(len(set(lab[seg == i].tolist())) <= 1 for i in range(len(q) - 1))
+
+
+def test_quantile_spacing_cannot_do_the_same(psr):
+    """Quantiles sit on the channel atoms, so segments do straddle boundaries."""
+    x = np.log(np.asarray(psr.freqs))
+    lab = np.asarray(psr.flags['fe']).astype(str)
+    n = 1 + len(set(lab.tolist())) + 8   # enough nodes to cut inside the receiver bands
+
+    q = np.log(s.makegp_fd_piecewise(psr, nodes=n, spacing='quantile').fd_nodes)
+    seg = np.clip(np.searchsorted(q, x, side='right') - 1, 0, len(q) - 2)
+    straddling = sum(len(set(lab[seg == i].tolist())) > 1 for i in range(len(q) - 1))
+    assert straddling > 0
+
+
+def test_edge_spacing_ignores_the_node_count(psr):
+    """The count follows from the flag, so nodes is not consulted."""
+    a = s.makegp_fd_piecewise(psr, nodes=4, spacing='edge', bin_flag='fe')
+    b = s.makegp_fd_piecewise(psr, nodes=64, spacing='edge', bin_flag='fe')
+    assert np.array_equal(a.fd_nodes, b.fd_nodes)
+
+
+def test_edge_spacing_still_partitions_unity(psr):
+    """Hat functions sum to one at every TOA, as under the other spacings."""
+    gp = s.makegp_fd_piecewise_matern(psr, spacing='edge', bin_flag='fe', project_tm=False)
+    rows = np.asarray(gp.F).sum(axis=1)
+    assert np.allclose(rows, 1.0, atol=1e-12)
+
+
+def test_edge_spacing_needs_a_bin_flag(psr):
+    """A missing bin_flag names the spacing actually in use, not 'flag'."""
+    with pytest.raises(ValueError, match="spacing='edge' needs bin_flag"):
+        s.makegp_fd_piecewise(psr, spacing='edge')
+
+
+def test_edge_spacing_rejects_an_absent_flag(psr):
+    with pytest.raises(KeyError, match="no flag 'nosuchflag'"):
+        s.makegp_fd_piecewise(psr, spacing='edge', bin_flag='nosuchflag')
+
+
+@pytest.mark.parametrize("prior_kind", ["improper", "matern"])
+def test_edge_builds_through_the_public_builders(psr, prior_kind, restore_priors):
+    build = (s.makegp_fd_piecewise if prior_kind == "improper"
+             else s.makegp_fd_piecewise_matern)
+    gp = build(psr, spacing='edge', bin_flag='fe')
+    nbin = len(set(np.asarray(psr.flags['fe']).astype(str).tolist()))
+    assert len(gp.fd_nodes) == nbin + 1
+
+
+def test_edge_spacing_rejects_bins_that_are_not_disjoint_in_frequency(psr):
+    """A per-receiver channel index is reused across receivers, so its bins interleave
+    and the midpoints between their means are not boundaries."""
+    with pytest.raises(ValueError, match="disjoint in frequency"):
+        s.makegp_fd_piecewise(psr, spacing='edge', bin_flag='chan')

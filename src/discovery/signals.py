@@ -977,6 +977,16 @@ def makegp_fd_piecewise(psr, nodes=16, spacing='quantile', selection=None, group
       resolution in the coordinate the ``FDx`` convention uses. Nodes landing in
       a gap produce empty columns which are dropped, so ``nodes`` is a requested
       rather than a delivered count.
+    - ``'edge'``: at the boundaries of the ``bin_flag`` bins -- the geometric
+      midpoint of the gap between consecutive bins, plus the two band ends -- so a
+      segment spans one bin and the delay is linear within it with a free slope.
+      ``nodes`` is ignored; the count follows from the flag, one more than the
+      number of bins. The bins must be disjoint in frequency, which a per-receiver
+      channel index reused across receivers is not. Adjacent segments share a node,
+      so this does not span the
+      ``kind='constant'`` indicator basis: holding one bin constant fixes a node
+      its neighbour also uses, and independent per-bin constants would need two
+      unshared nodes per bin.
 
     (Quantile placement is invariant under monotone transforms, so it gives the
     same nodes whether computed in frequency or log-frequency.)
@@ -1152,7 +1162,8 @@ def makegp_fd_piecewise_matern(psr, nodes=16, spacing='quantile', selection=None
     shared across blocks.
 
     nodes:      frequency nodes per block
-    spacing:    'quantile' (equal TOA counts) or 'log' (equal in log-frequency)
+    spacing:    'quantile' (equal TOA counts), 'log' (equal in log-frequency), or
+                'edge' (at the bin_flag bin boundaries, one segment per bin)
     selection:  callable, or list of callables, splitting the TOAs into blocks
     groups:     labels that get their own block alongside a global one
     project_tm: project the timing-model column subspace out of the basis
@@ -1283,6 +1294,9 @@ def _fd_piecewise_block(psr, x, sel, nodes, spacing, name, kind='linear', bin_fl
     interpolates between centres. kind='constant' builds indicator columns, where a
     node is a bin and the columns are disjoint, so a per-bin step is represented
     exactly in one column and ``F^T F`` is diagonal.
+
+    Under kind='linear' with spacing='edge' the nodes are the bin boundaries rather
+    than bin centres, so each hat straddles two bins and each segment covers one.
     """
     xs = x[sel]
 
@@ -1300,8 +1314,42 @@ def _fd_piecewise_block(psr, x, sel, nodes, spacing, name, kind='linear', bin_fl
         q = np.linspace(xs.min(), xs.max(), nodes)
     elif spacing == 'quantile':
         q = np.quantile(xs, np.linspace(0.0, 1.0, nodes))
+    elif spacing == 'edge':
+        pairs = [(lab, m) for lab, m in
+                 _fd_flag_masks(psr, sel, name, bin_flag, spacing='edge') if m.any()]
+        if len(pairs) < 2:
+            print(f"Warning: fd_piecewise selection {name!r} for {psr.name} has "
+                  f"{len(pairs)} non-empty {bin_flag!r} bin(s); skipped.")
+            return None
+
+        stats = np.array(sorted((x[m].mean(), x[m].min(), x[m].max()) for _, m in pairs))
+        centres, los, his = stats[:, 0], stats[:, 1], stats[:, 2]
+        sep = np.diff(centres)
+        # a boundary is only a boundary if consecutive bins do not share frequencies
+        over = np.divide(his[:-1] - los[1:], sep, out=np.full(len(sep), np.inf), where=sep > 0)
+        if np.any(over > 1.0):
+            raise ValueError(
+                f"makegp_fd_piecewise: spacing='edge' needs the {bin_flag!r} bins to be "
+                f"disjoint in frequency, but {int((over > 1.0).sum())} of {len(sep)} "
+                f"neighbouring pairs overlap by more than their separation, so their "
+                f"midpoints are not boundaries. A per-receiver channel index reused across "
+                f"receivers does this; combine it with the receiver flag, or pick a flag "
+                f"whose values partition the band.")
+        if np.any(over > 0.0):
+            print(f"Warning: fd_piecewise {name!r} for {psr.name}: "
+                  f"{int((over > 0.0).sum())} neighbouring {bin_flag!r} bin pair(s) overlap "
+                  f"in frequency; the node between them sits inside both.")
+
+        # the boundary is the middle of the empty gap between consecutive bins, which
+        # keeps each segment on one bin when the bins differ in width; where they touch
+        # there is no gap and the midpoint of their means is the only definition left
+        interior = np.where(his[:-1] < los[1:],
+                            0.5 * (his[:-1] + los[1:]),
+                            0.5 * (centres[:-1] + centres[1:]))
+        q = np.concatenate(([xs.min()], interior, [xs.max()]))
     else:
-        raise ValueError(f"makegp_fd_piecewise: spacing must be 'log' or 'quantile', got {spacing!r}.")
+        raise ValueError(f"makegp_fd_piecewise: for kind='linear', spacing must be "
+                         f"'log', 'quantile' or 'edge', got {spacing!r}.")
 
     q = np.unique(q)
     if len(q) < 2:
@@ -1322,10 +1370,10 @@ def _fd_piecewise_block(psr, x, sel, nodes, spacing, name, kind='linear', bin_fl
     return fmat, q
 
 
-def _fd_flag_masks(psr, sel, name, bin_flag, what='fd_piecewise'):
+def _fd_flag_masks(psr, sel, name, bin_flag, what='fd_piecewise', spacing='flag'):
     """Per-TOA masks for each distinct value of a named flag, in numeric order if possible."""
     if bin_flag is None:
-        raise ValueError(f"{what}: spacing='flag' needs bin_flag, the name of "
+        raise ValueError(f"{what}: spacing={spacing!r} needs bin_flag, the name of "
                          f"the per-TOA flag whose distinct values define the bins.")
     if bin_flag not in psr.flags:
         raise KeyError(f"{what}: {psr.name} has no flag {bin_flag!r}; available "
