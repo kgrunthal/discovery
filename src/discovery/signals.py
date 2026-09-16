@@ -1683,7 +1683,7 @@ def _pa_basis_parts(psr, bin_flag, harmonic, site, project, project_tm, name, wh
 
 
 def makegp_pa_quadrature(psr, bin_flag='chan', harmonic=2, site=None,
-                         project=None, project_tm=True, name='pa_gp'):
+                         project=None, project_tm=True, variant='iso', name='pa_gp'):
     """Delay locked to a harmonic of the parallactic angle, per frequency channel.
 
     For a receiver with fixed feeds the sky rotates through the parallactic angle
@@ -1710,9 +1710,16 @@ def makegp_pa_quadrature(psr, bin_flag='chan', harmonic=2, site=None,
     the leakage is a property of the receiver's channelisation, so bins inferred from
     the frequencies would be a guess at something the instrument already records.
 
-    The coefficients carry a proper prior ``Phi = sigma**2 I`` over the whole basis,
-    sampling one ``{psr}_{name}_log10_sigma``: a delay in seconds, per quadrature, with
-    a channel of amplitude A having ``E[A**2] = 2 sigma**2``. The box is ``[-10, -6]``.
+    The coefficients carry a proper prior over the whole basis, in seconds, on
+    ``[-10, -6]``. ``variant='iso'`` is ``Phi = sigma**2 I``, sampling one
+    ``{psr}_{name}_log10_sigma``, so a channel of amplitude A has ``E[A**2] = 2 sigma**2``
+    and its phase is uniform. ``'diag'`` gives the sin and cos blocks their own scales
+    ``_log10_sigma_X`` and ``_log10_sigma_Y``, and ``'full'`` adds their correlation
+    ``_rho_XY`` on ``[-1, 1]``; both give ``E[A**2] = sigma_X**2 + sigma_Y**2`` and a
+    phase drawn from an ellipse. Shifting the origin of ``psi`` rotates the coefficient
+    pair, so only ``'iso'`` and ``'full'`` are closed under it: ``'diag'`` pins the
+    ellipse to the quadratures, and ``rho -> +-1`` is
+    :func:`makegp_pa_common_phase`.
 
     The basis is not orthonormalised, and the projections are applied to the design
     matrix while Phi is left alone, which leaves the columns unequal in norm:
@@ -1732,6 +1739,7 @@ def makegp_pa_quadrature(psr, bin_flag='chan', harmonic=2, site=None,
                 indicator of a piecewise-constant FD basis; pass that GP here to remove
                 the overlap
     project_tm: remove the timing-model column span
+    variant:    ``'iso'``, ``'diag'`` or ``'full'``
     name:       base name for the GP parameters
     """
     from . import prior as _prior
@@ -1757,22 +1765,53 @@ def makegp_pa_quadrature(psr, bin_flag='chan', harmonic=2, site=None,
                   f'basis and integrate back to their prior rather than being dropped, '
                   f'so the marginal likelihood is unaffected.')
 
-    signame = f'{psr.name}_{name}_log10_sigma'
-    ones = matrix.jnparray(np.ones(fmat.shape[1]))
+    if variant not in ('iso', 'diag', 'full'):
+        raise ValueError(f"makegp_pa_quadrature: variant must be 'iso', 'diag' or 'full', "
+                         f"got {variant!r}.")
+    nbin = ind.shape[1]
 
-    def getphi(params):
-        return 10.0**(2.0 * params[signame]) * ones
-    getphi.params = [signame]
+    if variant == 'iso':
+        suffixes = [('log10_sigma', [-10.0, -6.0])]
+        signame = f'{psr.name}_{name}_log10_sigma'
+        ones = matrix.jnparray(np.ones(fmat.shape[1]))
+
+        def getphi(params):
+            return 10.0**(2.0 * params[signame]) * ones
+    else:
+        suffixes = [('log10_sigma_X', [-10.0, -6.0]), ('log10_sigma_Y', [-10.0, -6.0])]
+        sxname = f'{psr.name}_{name}_log10_sigma_X'
+        syname = f'{psr.name}_{name}_log10_sigma_Y'
+        rhoname = f'{psr.name}_{name}_rho_XY'
+        blk = matrix.jnparray(np.ones(nbin))
+
+        if variant == 'diag':
+            def getphi(params):
+                return jnp.concatenate([10.0**(2.0 * params[sxname]) * blk,
+                                        10.0**(2.0 * params[syname]) * blk])
+        else:
+            suffixes.append(('rho_XY', [-1.0, 1.0]))
+            eye = matrix.jnparray(np.eye(nbin))
+
+            def getphi(params):
+                sX, sY = 10.0**params[sxname], 10.0**params[syname]
+                r = params[rhoname]
+                M = jnp.array([[sX * sX, r * sX * sY], [r * sX * sY, sY * sY]])
+                return jnp.kron(M, eye)
+
+    getphi.params = [f'{psr.name}_{name}_{suf}' for suf, _ in suffixes]
 
     _prior.priordict_standard.update(
-        {f'{re.escape(psr.name)}_{name}_log10_sigma': [-10.0, -6.0]})
+        {f'{re.escape(psr.name)}_{name}_{suf}': box for suf, box in suffixes})
 
-    gp = matrix.VariableGP(matrix.NoiseMatrix1D_var(getphi), fmat)
+    Phi = (matrix.NoiseMatrix2D_var(getphi) if variant == 'full'
+           else matrix.NoiseMatrix1D_var(getphi))
+    gp = matrix.VariableGP(Phi, fmat)
     gp.index = {f'{psr.name}_{name}_coefficients({fmat.shape[1]})': slice(0, fmat.shape[1])}
     gp.name, gp.pos, gp.gpname, gp.gpcommon = psr.name, psr.pos, name, []
     gp.pa_harmonic = harmonic
     gp.pa_bins = np.exp(q)
     gp.pa_angle = psi
+    gp.pa_variant = variant
 
     return gp
 

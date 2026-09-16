@@ -360,7 +360,7 @@ def single_pulsar_noise(psr, fftint=True, max_cadence_days=14, Tspan=None, noise
                         ecorr=True, quadratic=False, ecorr_nmodes=None, ecorr_correlated=False, global_ecorr=False, ecorr_tobs_scale=False, # ecorr options. ecorr_tobs_scale weights the ECORR basis by sqrt(tobs_ref/tobs), making log10_ecorr the jitter at the reference integration time rather than an average over integrations of unequal length. ecorr_nmodes=N selects an N-mode Legendre ECORR (log-frequency basis; nmodes=1 is standard ECORR); ecorr_correlated=True uses the full-M (correlated-mode) variant that can also model a frequency-asymmetric jitter amplitude
                         background=True, bkgrnd_log10_A=None, red=True, red2=False, dm=True, chrom=True, chrom_alpha=None, chrom_fref=1400.0, chrom_poly=True, sw=True, sw_powerlaw=False, sw_qp=False, sw_logf=False, turnover=None, # Base model: gwb, red, dm, chromatic, solar wind (sw_powerlaw=True selects the legacy power-law solar-wind GP instead of the time-domain one; sw_logf=True log-spaces its frequencies -- Fourier path only)
                         band=False, band_alpha=False, band_bw_min=20.0, fd=False, fd_nodes=16, fd_spacing='quantile', fd_selection=None, fd_prior='improper', fd_kind='linear', fd_bin_flag=None, fd_normalise=False, # Additional GP models (fd=True marginalises an arbitrary time-constant frequency-dependent delay over fd_nodes frequency nodes; fd_selection splits it per TOA group; fd_prior selects the improper or the Matern-3/2 prior over the node amplitudes)
-                        pa_gp=False, pa_phase='free', pa_bin_flag='chan', pa_project_fd=True, # Delay locked to twice the parallactic angle. pa_phase='free': an amplitude and phase per channel; 'common': one phase across channels, sampled as {psr}_pa_gp_phase in radians, with a signed amplitude per channel; a number fixes that phase. pa_project_fd removes the fd column span from the basis
+                        pa_gp=False, pa_phase='free', pa_variant='iso', pa_bin_flag='chan', pa_project_fd=True, # Delay locked to twice the parallactic angle. pa_phase='free': an amplitude and phase per channel; 'common': one phase across channels, sampled as {psr}_pa_gp_phase in radians, with a signed amplitude per channel; a number fixes that phase. pa_variant sets the prior on the free-phase pair: 'iso' one scale, 'diag' a scale per quadrature, 'full' adding their correlation. pa_project_fd removes the fd column span from the basis
                         pa_boost=False, pa_boost_z=None, pa_boost_variant='full', pa_boost_hand=1, pa_boost_chi0=0.0, pa_boost_era_split=None, # Polarimetric boost delay in boost units (signals.makegp_pa_boost) over the pa_bin_flag channels, needing the per-channel susceptibilities pa_boost_z; shares pa_project_fd. Exclusive with pa_gp, whose column space it spans
                         chrom_annual=False, chrom_exponential=False, chrom_gaussian=False, chrom_sphere=False, chrom_step=False, # Deterministic chromatic models
                         shapiro=False, orbital_dm=False, extra_gps=None, # Shapiro delay and orbital DM, and extra GPs
@@ -472,9 +472,14 @@ def single_pulsar_noise(psr, fftint=True, max_cadence_days=14, Tspan=None, noise
     if pa_gp:
         pa_project = fd_gp if (pa_project_fd and fd_gp is not None) else None
         fixed = isinstance(pa_phase, (int, float)) and not isinstance(pa_phase, bool)
+        if pa_phase != 'free' and pa_variant != 'iso':
+            raise ValueError(f"single_pulsar_noise: pa_variant={pa_variant!r} applies to the "
+                             f"free-phase model; the common-phase one carries a single "
+                             f"amplitude per channel.")
         if pa_phase == 'free':
             model_components += [signals.makegp_pa_quadrature(
-                psr, bin_flag=pa_bin_flag, name='pa_gp', project=pa_project)]
+                psr, bin_flag=pa_bin_flag, name='pa_gp', project=pa_project,
+                variant=pa_variant)]
         elif pa_phase == 'common' or fixed:
             model_components += [signals.makegp_pa_common_phase(
                 psr, bin_flag=pa_bin_flag, name='pa_gp', project=pa_project,
@@ -626,6 +631,14 @@ def common_noise(psrs, chain_dfs, fftInt=True, max_cadence_days=14, Tspan=None,
             return pa_phase
         return 'common' if name in _pa_common else 'free'
 
+    # The free-phase prior leaves its own parameters, so the variant is read per pulsar.
+    _pa_variant = {psr.name: ('full' if has_param(df, "pa_gp_rho_XY") else
+                              'diag' if has_param(df, "pa_gp_log10_sigma_Y") else 'iso')
+                   for psr, df in zip(psrs, chain_dfs) if psr.name in _pa_psrs}
+
+    def _pa_variant_for(name):
+        return _pa_variant.get(name, 'iso') if _pa_phase_for(name) == 'free' else 'iso'
+
     # The boost GP's variant is read from its parameters; its susceptibilities, hand,
     # fixed chi0 and era split leave nothing behind and come from the arguments.
     _boost = {}
@@ -657,6 +670,7 @@ def common_noise(psrs, chain_dfs, fftInt=True, max_cadence_days=14, Tspan=None,
         variant = (f"pa_phase={pa_phase!r} is applied to all of them" if pa_phase is not None
                    else f"{len(_pa_common)} of them carry pa_gp_phase and get one phase "
                         f"across channels, the rest a free phase per channel")
+        variant += f"; free-phase priors {sorted(set(_pa_variant_for(n) for n in _pa_psrs))}"
         print(f"pa_gp: {len(_pa_psrs)} of {len(psrs)} pulsar(s) carry the "
               f"parallactic-angle GP, from the chains; {variant}. Its basis is built with "
               f"bin_flag={pa_bin_flag!r} and pa_project_fd={pa_project_fd}, which must "
@@ -873,7 +887,7 @@ def common_noise(psrs, chain_dfs, fftInt=True, max_cadence_days=14, Tspan=None,
                                        band=False, band_alpha=False,
                                        chrom_annual=has_param(df, "chrom_1yr"), chrom_exponential=has_param(df, "chrom_exp"), chrom_gaussian=has_param(df, "chrom_gauss"), chrom_sphere=has_param(df, "chrom_sphere"), chrom_step=has_param(df, "chrom_step"),
                                        fd=fd, fd_nodes=fd_nodes, fd_spacing=fd_spacing, fd_selection=fd_selection, fd_prior=fd_prior, fd_kind=fd_kind, fd_bin_flag=fd_bin_flag, fd_normalise=fd_normalise,
-                                       pa_gp=(psr.name in _pa_psrs), pa_phase=_pa_phase_for(psr.name), pa_bin_flag=pa_bin_flag, pa_project_fd=pa_project_fd, **_boost_kw(psr.name),
+                                       pa_gp=(psr.name in _pa_psrs), pa_phase=_pa_phase_for(psr.name), pa_variant=_pa_variant_for(psr.name), pa_bin_flag=pa_bin_flag, pa_project_fd=pa_project_fd, **_boost_kw(psr.name),
                                        extra_gps=(sw_gps + pe_delays))
 
             per_psr_stack_gps.append(matrix.CompoundGP(stack_gps + common_gps))
@@ -889,7 +903,7 @@ def common_noise(psrs, chain_dfs, fftInt=True, max_cadence_days=14, Tspan=None,
                                     band=has_param(df, "band_gp"), band_alpha=has_param(df, "bandalpha_gp"),
                                     chrom_annual=has_param(df, "chrom_1yr"), chrom_exponential=has_param(df, "chrom_exp"), chrom_gaussian=has_param(df, "chrom_gauss"), chrom_sphere=has_param(df, "chrom_sphere"), chrom_step=has_param(df, "chrom_step"),
                                     fd=fd, fd_nodes=fd_nodes, fd_spacing=fd_spacing, fd_selection=fd_selection, fd_prior=fd_prior, fd_kind=fd_kind, fd_bin_flag=fd_bin_flag, fd_normalise=fd_normalise,
-                                    pa_gp=(psr.name in _pa_psrs), pa_phase=_pa_phase_for(psr.name), pa_bin_flag=pa_bin_flag, pa_project_fd=pa_project_fd, **_boost_kw(psr.name),
+                                    pa_gp=(psr.name in _pa_psrs), pa_phase=_pa_phase_for(psr.name), pa_variant=_pa_variant_for(psr.name), pa_bin_flag=pa_bin_flag, pa_project_fd=pa_project_fd, **_boost_kw(psr.name),
                                     extra_gps=(common_gps + pe_delays))
 
             check_white_noise_names_match(psr, df)

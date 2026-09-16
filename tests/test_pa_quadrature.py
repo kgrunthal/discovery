@@ -273,7 +273,7 @@ def test_injected_pa_delay_is_recovered_at_the_right_scale(psr):
 
 # --- threading through common_noise -----------------------------------------------
 
-def _fake_chain(psr, pa=False, pa_common=False, boost=None):
+def _fake_chain(psr, pa=False, pa_common=False, boost=None, pa_variant=None):
     """Minimal stage-1 chain: red noise, per-backend efac, and optionally the PA scale,
     with the phase too for the common-phase variant."""
     import pandas as pd
@@ -282,7 +282,9 @@ def _fake_chain(psr, pa=False, pa_common=False, boost=None):
     cols += [f'{psr.name}_{be}_efac'
              for be in sorted(set(np.asarray(psr.backend_flags).tolist()))]
     if pa or pa_common:
-        cols += [f'{psr.name}_pa_gp_log10_sigma']
+        cols += ([f'{psr.name}_pa_gp_log10_sigma'] if pa_variant is None else
+                 [f'{psr.name}_pa_gp_log10_sigma_X', f'{psr.name}_pa_gp_log10_sigma_Y'] +
+                 ([f'{psr.name}_pa_gp_rho_XY'] if pa_variant == 'full' else []))
     if pa_common:
         cols += [f'{psr.name}_pa_gp_phase']
     if boost == 'iso':
@@ -699,3 +701,151 @@ def test_common_noise_reads_the_boost_variant_from_the_chains(two_psrs):
     with pytest.raises(ValueError, match="no susceptibilities"):
         mpta.common_noise(two_psrs, [_fake_chain(a, boost='full'), _fake_chain(b)],
                           fd=False, pa_bin_flag='chan', noise_point='median')
+
+
+# --- anisotropy in the free-phase pair ---------------------------------------------
+
+def _pa(psr, variant='iso', **kw):
+    return s.makegp_pa_quadrature(psr, bin_flag='chan', site=SITE, variant=variant, **kw)
+
+
+def _K(gp, params, idx):
+    """Implied delay covariance F Phi F^T on a subset of TOAs, for either Phi shape."""
+    F = np.asarray(gp.F)[idx]
+    Phi = np.asarray(gp.Phi.getN(params))
+    return F @ (Phi @ F.T) if Phi.ndim == 2 else F @ (Phi[:, None] * F.T)
+
+
+def _scales(psr, sx, sy, rho=None):
+    out = {f'{psr.name}_pa_gp_log10_sigma_X': np.log10(sx),
+           f'{psr.name}_pa_gp_log10_sigma_Y': np.log10(sy)}
+    if rho is not None:
+        out[f'{psr.name}_pa_gp_rho_XY'] = rho
+    return out
+
+
+def test_quadrature_defaults_to_one_scale(psr):
+    gp = _pa(psr)
+    assert gp.pa_variant == 'iso'
+    assert gp.Phi.getN.params == [f'{psr.name}_pa_gp_log10_sigma']
+
+
+def test_quadrature_anisotropic_parameter_names_and_boxes(psr):
+    import re
+    from discovery import prior
+    e = re.escape(psr.name)
+    assert _pa(psr, 'diag').Phi.getN.params == [f'{psr.name}_pa_gp_log10_sigma_X',
+                                                f'{psr.name}_pa_gp_log10_sigma_Y']
+    assert prior.priordict_standard[f'{e}_pa_gp_log10_sigma_X'] == [-10.0, -6.0]
+    assert prior.priordict_standard[f'{e}_pa_gp_log10_sigma_Y'] == [-10.0, -6.0]
+    assert _pa(psr, 'full').Phi.getN.params == [f'{psr.name}_pa_gp_log10_sigma_X',
+                                                f'{psr.name}_pa_gp_log10_sigma_Y',
+                                                f'{psr.name}_pa_gp_rho_XY']
+    assert prior.priordict_standard[f'{e}_pa_gp_rho_XY'] == [-1.0, 1.0]
+
+
+def test_quadrature_phi_shapes_split_the_blocks(psr):
+    """diag stays diagonal, one scale per quadrature block; full is M (x) I over channels."""
+    n = np.asarray(_pa(psr).F).shape[1] // 2
+    d = np.asarray(_pa(psr, 'diag').Phi.getN(_scales(psr, 1e-7, 1e-9)))
+    assert d.shape == (2 * n,)
+    assert np.allclose(d[:n], 1e-14) and np.allclose(d[n:], 1e-18)
+    f = np.asarray(_pa(psr, 'full').Phi.getN(_scales(psr, 1e-7, 1e-9, 0.3)))
+    M = np.array([[1e-14, 0.3 * 1e-7 * 1e-9], [0.3 * 1e-7 * 1e-9, 1e-18]])
+    assert np.allclose(f, np.kron(M, np.eye(n)), rtol=1e-12)
+
+
+def test_quadrature_variants_nest_at_equal_scales(psr):
+    """diag with one scale, and full with rho = 0, are the isotropic model exactly."""
+    idx = np.arange(0, len(psr.toas), 23)[:300]
+    sig = 3e-8
+    Ki = _K(_pa(psr, project_tm=False), {f'{psr.name}_pa_gp_log10_sigma': np.log10(sig)}, idx)
+    Kd = _K(_pa(psr, 'diag', project_tm=False), _scales(psr, sig, sig), idx)
+    Kf = _K(_pa(psr, 'full', project_tm=False), _scales(psr, sig, sig, 0.0), idx)
+    assert np.allclose(Kd, Ki, rtol=0.0, atol=1e-30)
+    assert np.allclose(Kf, Ki, rtol=0.0, atol=1e-30)
+
+
+def _shifted(psr, variant, chi):
+    """The quadrature basis with the origin of psi moved by chi, from the shipped boost
+    builder: with z = (0, 1 s) its columns are [sin 2(psi + chi) | cos 2(psi + chi)]."""
+    z = {lab: (0.0, 1.0) for lab in sorted(set(np.asarray(psr.flags['chan']).astype(str).tolist()), key=int)}
+    return s.makegp_pa_boost(psr, z, bin_flag='chan', site=SITE, variant=variant,
+                             chi0=chi, project_tm=False)
+
+
+def _bscales(psr, sx, sy, rho=None):
+    out = {f'{psr.name}_pa_boost_log10_sigma_X': np.log10(sx),
+           f'{psr.name}_pa_boost_log10_sigma_Y': np.log10(sy)}
+    if rho is not None:
+        out[f'{psr.name}_pa_boost_rho_XY'] = rho
+    return out
+
+
+def test_iso_is_invariant_to_the_psi_origin_and_diag_is_not(psr):
+    """psi = 0 is transit, an arbitrary origin: only a rotation-covariant prior is a
+    statement about the instrument rather than about the source's culmination."""
+    idx = np.arange(0, len(psr.toas), 23)[:300]
+    sx, sy, chi = 3e-8, 1e-8, 0.35
+    Ki0 = _K(_shifted(psr, 'iso', 0.0), {f'{psr.name}_pa_boost_log10_sigma': np.log10(sx)}, idx)
+    Kic = _K(_shifted(psr, 'iso', chi), {f'{psr.name}_pa_boost_log10_sigma': np.log10(sx)}, idx)
+    assert np.abs(Kic - Ki0).max() / np.abs(Ki0).max() < 1e-12
+
+    Kd0 = _K(_shifted(psr, 'diag', 0.0), _bscales(psr, sx, sy), idx)
+    Kdc = _K(_shifted(psr, 'diag', chi), _bscales(psr, sx, sy), idx)
+    assert np.abs(Kdc - Kd0).max() / np.abs(Kd0).max() > 0.1
+
+
+def test_full_is_closed_under_a_shift_of_the_psi_origin(psr):
+    """diag at origin chi is full at origin 0 with M -> R(2 chi) M R(2 chi)^T."""
+    idx = np.arange(0, len(psr.toas), 23)[:300]
+    sx, sy, chi = 3e-8, 1e-8, 0.35
+    Kdc = _K(_shifted(psr, 'diag', chi), _bscales(psr, sx, sy), idx)
+
+    c2, s2 = np.cos(2 * chi), np.sin(2 * chi)
+    R = np.array([[c2, -s2], [s2, c2]])
+    M = R @ np.diag([sx**2, sy**2]) @ R.T
+    sxp, syp = np.sqrt(M[0, 0]), np.sqrt(M[1, 1])
+    Kf = _K(_pa(psr, 'full', project_tm=False), _scales(psr, sxp, syp, M[0, 1] / (sxp * syp)), idx)
+    assert np.abs(Kf - Kdc).max() / np.abs(Kdc).max() < 1e-12
+
+
+def test_full_at_unit_correlation_is_the_common_phase_model(psr):
+    """rho = +-1 with equal scales collapses each channel pair onto sin(2 psi +- pi/4)."""
+    idx = np.arange(0, len(psr.toas), 23)[:300]
+    sig = 3e-8
+    cp = s.makegp_pa_common_phase(psr, bin_flag='chan', site=SITE, project_tm=False)
+    for rho, theta in ((1.0, np.pi / 4), (-1.0, -np.pi / 4)):
+        Kf = _K(_pa(psr, 'full', project_tm=False), _scales(psr, sig, sig, rho), idx)
+        Fc = np.asarray(cp.F({f'{psr.name}_pa_gp_phase': theta}))[idx]
+        Kc = (2 * sig**2) * (Fc @ Fc.T)
+        assert np.abs(Kf - Kc).max() / np.abs(Kc).max() < 1e-12
+
+
+def test_quadrature_rejects_an_unknown_variant(psr):
+    with pytest.raises(ValueError, match="variant must be 'iso', 'diag' or 'full'"):
+        _pa(psr, 'axial')
+
+
+def test_single_pulsar_noise_pa_variant_selects_the_prior(two_psrs):
+    from discovery.models import mpta
+
+    a = two_psrs[0]
+    iso = mpta.single_pulsar_noise(a, fftint=False, pa_gp=True)
+    full = mpta.single_pulsar_noise(a, fftint=False, pa_gp=True, pa_variant='full')
+    assert f'{a.name}_pa_gp_log10_sigma' in iso.logL.params
+    assert f'{a.name}_pa_gp_rho_XY' in full.logL.params
+    assert f'{a.name}_pa_gp_log10_sigma' not in full.logL.params
+    with pytest.raises(ValueError, match="applies to the free-phase model"):
+        mpta.single_pulsar_noise(a, fftint=False, pa_gp=True, pa_phase='common', pa_variant='diag')
+
+
+def test_common_noise_reads_the_pa_variant_from_the_chains(two_psrs):
+    from discovery.models import mpta
+
+    a, b = two_psrs
+    m = mpta.common_noise(two_psrs, [_fake_chain(a, pa=True, pa_variant='full'), _fake_chain(b, pa=True)],
+                          fd=False, pa_bin_flag='chan', noise_point='median')
+    assert sorted(p for p in m.logL.params if 'pa_gp' in p) == sorted([
+        f'{a.name}_pa_gp_log10_sigma_X', f'{a.name}_pa_gp_log10_sigma_Y', f'{a.name}_pa_gp_rho_XY',
+        f'{b.name}_pa_gp_log10_sigma'])
