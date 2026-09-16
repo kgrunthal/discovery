@@ -273,15 +273,24 @@ def test_injected_pa_delay_is_recovered_at_the_right_scale(psr):
 
 # --- threading through common_noise -----------------------------------------------
 
-def _fake_chain(psr, pa=False):
-    """Minimal stage-1 chain: red noise, per-backend efac, and optionally the PA scale."""
+def _fake_chain(psr, pa=False, pa_common=False, boost=None):
+    """Minimal stage-1 chain: red noise, per-backend efac, and optionally the PA scale,
+    with the phase too for the common-phase variant."""
     import pandas as pd
 
     cols = [f'{psr.name}_red_noise_log10_A', f'{psr.name}_red_noise_gamma']
     cols += [f'{psr.name}_{be}_efac'
              for be in sorted(set(np.asarray(psr.backend_flags).tolist()))]
-    if pa:
+    if pa or pa_common:
         cols += [f'{psr.name}_pa_gp_log10_sigma']
+    if pa_common:
+        cols += [f'{psr.name}_pa_gp_phase']
+    if boost == 'iso':
+        cols += [f'{psr.name}_pa_boost_log10_sigma']
+    elif boost in ('diag', 'full'):
+        cols += [f'{psr.name}_pa_boost_log10_sigma_X', f'{psr.name}_pa_boost_log10_sigma_Y']
+        if boost == 'full':
+            cols += [f'{psr.name}_pa_boost_rho_XY']
 
     df = pd.DataFrame({c: np.linspace(-8.0, -7.0, 8) for c in cols})
     df.attrs['noisedict'] = {}
@@ -354,3 +363,339 @@ def test_commongp_falls_back_rather_than_stacking_a_variable_core(two_psrs, caps
     out = capsys.readouterr().out
     assert 'parallactic-angle GP, which is not stackable' in out
     assert 'Falling back to the GlobalLikelihood path' in out
+
+
+# --- one phase across channels ----------------------------------------------------
+
+def _phase_key(psr):
+    return f'{psr.name}_pa_gp_phase'
+
+
+def _params_at(m, psr, theta, log10_sigma):
+    return {k: (1.0 if k.endswith('efac') else theta if k == _phase_key(psr)
+                else log10_sigma if 'pa_gp' in k else -8.0) for k in m.logL.params}
+
+
+def test_common_phase_is_the_free_basis_collapsed_onto_one_phase(psr):
+    """Column c is 1[chan=c] sin(m psi + theta) = F_sin cos(theta) + F_cos sin(theta)."""
+    free = s.makegp_pa_quadrature(psr, bin_flag='chan', site=SITE, project_tm=False)
+    Ff = np.asarray(free.F)
+    n = Ff.shape[1] // 2
+    gp = s.makegp_pa_common_phase(psr, bin_flag='chan', site=SITE, project_tm=False)
+    assert callable(gp.F)
+    for theta in (-1.2, 0.0, 0.7):
+        Fc = np.asarray(gp.F({_phase_key(psr): theta}))
+        assert Fc.shape == (Ff.shape[0], n)
+        assert np.allclose(Fc, Ff[:, :n] * np.cos(theta) + Ff[:, n:] * np.sin(theta), atol=1e-12)
+
+
+def test_common_phase_coefficient_is_the_signed_channel_amplitude(psr):
+    """Each column is sin(2 psi + theta) on exactly one channel and zero elsewhere."""
+    gp = s.makegp_pa_common_phase(psr, bin_flag='chan', site=SITE, project_tm=False)
+    psi = s.parallactic_angle(psr, site=SITE)
+    lab = np.asarray(psr.flags['chan']).astype(str)
+    F = np.asarray(gp.F({_phase_key(psr): 0.4}))
+    for j in range(F.shape[1]):
+        on = F[:, j] != 0.0
+        assert len(set(lab[on].tolist())) == 1
+        assert np.allclose(F[on, j], np.sin(2 * psi[on] + 0.4), atol=1e-12)
+
+
+def test_common_phase_prior_boxes_are_registered(psr):
+    import re
+    from discovery import prior
+    s.makegp_pa_common_phase(psr, bin_flag='chan', site=SITE)
+    assert prior.priordict_standard[f'{re.escape(psr.name)}_pa_gp_log10_sigma'] == [-10.0, -6.0]
+    assert prior.priordict_standard[f'{re.escape(psr.name)}_pa_gp_phase'] == \
+        [-0.5 * float(np.pi), 0.5 * float(np.pi)]
+
+
+def test_common_phase_projection_holds_at_every_phase(psr):
+    """The blocks are projected once; the combination must stay orthogonal to the span."""
+    gp = s.makegp_pa_common_phase(psr, bin_flag='chan', site=SITE, project_tm=True)
+    Q = np.linalg.qr(s.normalise_tm_basis(psr))[0]
+    for theta in (-1.0, 0.3, 1.4):
+        F = np.asarray(gp.F({_phase_key(psr): theta}))
+        assert np.abs(Q.T @ F).max() < 1e-9
+
+
+def test_common_phase_fixed_phase_gives_a_constant_basis_and_no_parameter(psr):
+    var = s.makegp_pa_common_phase(psr, bin_flag='chan', site=SITE)
+    fix = s.makegp_pa_common_phase(psr, bin_flag='chan', site=SITE, phase=0.6)
+    assert not callable(fix.F)
+    assert np.allclose(np.asarray(fix.F), np.asarray(var.F({_phase_key(psr): 0.6})), atol=1e-12)
+    m = dl.PulsarLikelihood([psr.residuals, s.makenoise_measurement(psr, {}),
+                             s.makegp_timing(psr, svd=True), fix])
+    assert _phase_key(psr) not in m.logL.params
+    assert f'{psr.name}_pa_gp_log10_sigma' in m.logL.params
+
+
+def _inject_common_phase(psr, theta_true, rng):
+    """Signed per-channel amplitudes on one phase, at twice the per-channel amplitude error."""
+    psi = s.parallactic_angle(psr, site=SITE)
+    lab = np.asarray(psr.flags['chan']).astype(str)
+    order = sorted(set(lab.tolist()), key=int)
+    err = np.asarray(psr.toaerrs)
+    per_bin = np.median([int((lab == v).sum()) for v in order])
+    sigma_true = float(2.0 * np.median(err) / np.sqrt(0.5 * per_bin))
+    delay = np.zeros(len(psi))
+    for v in order:
+        m = lab == v
+        delay[m] = rng.normal(scale=sigma_true) * np.sin(2 * psi[m] + theta_true)
+    return delay + rng.normal(scale=err), sigma_true
+
+
+def test_common_phase_is_pi_periodic_and_the_phase_matters(psr):
+    """A signed amplitude makes theta and theta + pi one model; theta + pi/2 is not."""
+    res, sigma_true = _inject_common_phase(psr, 0.4, np.random.default_rng(3))
+    gp = s.makegp_pa_common_phase(psr, bin_flag='chan', site=SITE)
+    m = dl.PulsarLikelihood([res, s.makenoise_measurement(psr, {}),
+                             s.makegp_timing(psr, svd=True), gp])
+    ls = np.log10(sigma_true)
+    l0 = float(m.logL(_params_at(m, psr, 0.4, ls)))
+    l1 = float(m.logL(_params_at(m, psr, 0.4 + np.pi, ls)))
+    l2 = float(m.logL(_params_at(m, psr, 0.4 + np.pi / 2, ls)))
+    assert abs(l0 - l1) < 1e-6 * max(1.0, abs(l0))
+    assert abs(l0 - l2) > 1.0
+
+
+def test_common_phase_injection_is_covered_by_the_phase_profile_and_recovers_the_scale(psr):
+    """The truth must lie inside the 2-nat interval of the theta profile, whatever the
+    fixture's parallactic-angle coverage resolves, and sigma must come back at scale."""
+    theta_true = 0.5
+    res, sigma_true = _inject_common_phase(psr, theta_true, np.random.default_rng(20260912))
+    gp = s.makegp_pa_common_phase(psr, bin_flag='chan', site=SITE)
+    m = dl.PulsarLikelihood([res, s.makenoise_measurement(psr, {}),
+                             s.makegp_timing(psr, svd=True), gp])
+    ls = np.log10(sigma_true)
+
+    thetas = np.linspace(-np.pi / 2, np.pi / 2, 73)[:-1]
+    curve = np.array([float(m.logL(_params_at(m, psr, t, ls))) for t in thetas])
+    curve -= curve.max()
+    assert curve.min() < -20.0, "the phase must matter somewhere on the half-turn"
+    at_truth = float(m.logL(_params_at(m, psr, theta_true, ls))) - (curve.max() +
+               float(m.logL(_params_at(m, psr, thetas[int(np.argmax(curve))], ls))) - curve.max())
+    assert at_truth > -2.0, at_truth
+
+    grid = np.linspace(-10.0, -6.0, 41)
+    curve2 = np.array([float(m.logL(_params_at(m, psr, theta_true, g))) for g in grid])
+    assert abs(grid[int(np.argmax(curve2))] - ls) < 0.3
+    assert curve2.max() - curve2[0] > 20.0
+
+
+def test_single_pulsar_noise_pa_phase_selects_the_basis(two_psrs):
+    from discovery.models import mpta
+
+    a = two_psrs[0]
+    free = mpta.single_pulsar_noise(a, fftint=False, pa_gp=True, pa_phase='free')
+    common = mpta.single_pulsar_noise(a, fftint=False, pa_gp=True, pa_phase='common')
+    fixed = mpta.single_pulsar_noise(a, fftint=False, pa_gp=True, pa_phase=0.21)
+    assert _phase_key(a) not in free.logL.params
+    assert _phase_key(a) in common.logL.params
+    assert _phase_key(a) not in fixed.logL.params
+    assert all(f'{a.name}_pa_gp_log10_sigma' in m.logL.params for m in (free, common, fixed))
+    with pytest.raises(ValueError, match="pa_phase must be"):
+        mpta.single_pulsar_noise(a, fftint=False, pa_gp=True, pa_phase='both')
+
+
+def test_common_noise_reads_the_common_phase_variant_from_the_chains(two_psrs):
+    """A chain carrying pa_gp_phase gets the one-phase basis; one without keeps the free one."""
+    from discovery.models import mpta
+
+    a, b = two_psrs
+    m = mpta.common_noise(two_psrs, [_fake_chain(a, pa_common=True), _fake_chain(b, pa=True)],
+                          fd=False, pa_bin_flag='chan', noise_point='median')
+    assert sorted(p for p in m.logL.params if 'pa_gp' in p) == sorted([
+        f'{a.name}_pa_gp_log10_sigma', _phase_key(a), f'{b.name}_pa_gp_log10_sigma'])
+
+
+def test_common_noise_pa_phase_override_applies_to_every_carrier(two_psrs):
+    """A fixed-phase stage-1 run is indistinguishable from the free one, so it is declared."""
+    from discovery.models import mpta
+
+    a, b = two_psrs
+    m = mpta.common_noise(two_psrs, [_fake_chain(a, pa=True), _fake_chain(b)],
+                          fd=False, pa_bin_flag='chan', noise_point='median', pa_phase=0.21)
+    pa = sorted(p for p in m.logL.params if 'pa_gp' in p)
+    assert pa == [f'{a.name}_pa_gp_log10_sigma']
+    m2 = mpta.common_noise(two_psrs, [_fake_chain(a, pa=True), _fake_chain(b)],
+                           fd=False, pa_bin_flag='chan', noise_point='median', pa_phase='common')
+    assert _phase_key(a) in m2.logL.params
+
+
+# --- boost-unit basis with per-channel susceptibilities -----------------------------
+
+def _labels(psr):
+    return sorted(set(np.asarray(psr.flags['chan']).astype(str).tolist()), key=int)
+
+
+def _z(psr, zQ=0.0, zU=1.0, seed=None):
+    if seed is None:
+        return {lab: (zQ, zU) for lab in _labels(psr)}
+    rng = np.random.default_rng(seed)
+    return {lab: tuple(rng.normal(scale=1e-5, size=2)) for lab in _labels(psr)}
+
+
+def test_boost_with_unit_u_susceptibility_is_the_quadrature_basis(psr):
+    """zQ = 0, zU = 1 s, chi0 = 0, h = +1 must give exactly [sin 2psi | cos 2psi]."""
+    for project_tm in (False, True):
+        quad = s.makegp_pa_quadrature(psr, bin_flag='chan', site=SITE, project_tm=project_tm)
+        boost = s.makegp_pa_boost(psr, _z(psr), bin_flag='chan', site=SITE, project_tm=project_tm)
+        assert np.allclose(np.asarray(boost.F), np.asarray(quad.F), rtol=0.0, atol=1e-14)
+
+
+def test_boost_columns_follow_the_pib_rotation(psr):
+    """dX = zQ cos 2h psi + zU sin 2h psi and dY = -zQ sin 2h psi + zU cos 2h psi, per channel."""
+    z = _z(psr, seed=5)
+    psi = s.parallactic_angle(psr, site=SITE)
+    lab = np.asarray(psr.flags['chan']).astype(str)
+    for h in (1, -1):
+        gp = s.makegp_pa_boost(psr, z, bin_flag='chan', site=SITE, hand=h, project_tm=False)
+        F = np.asarray(gp.F); n = F.shape[1] // 2
+        for j, v in enumerate(gp.pa_labels):
+            m = lab == v; zQ, zU = z[v]
+            assert np.allclose(F[m, j], zQ * np.cos(2 * h * psi[m]) + zU * np.sin(2 * h * psi[m]), atol=1e-16)
+            assert np.allclose(F[m, n + j], -zQ * np.sin(2 * h * psi[m]) + zU * np.cos(2 * h * psi[m]), atol=1e-16)
+            assert np.all(F[~m, j] == 0.0) and np.all(F[~m, n + j] == 0.0)
+
+
+def test_boost_chi0_offsets_the_angle(psr):
+    """A fixed chi0 equals evaluating the h = +1 rotation at psi + chi0."""
+    z = _z(psr, seed=6)
+    psi = s.parallactic_angle(psr, site=SITE)
+    lab = np.asarray(psr.flags['chan']).astype(str)
+    gp = s.makegp_pa_boost(psr, z, bin_flag='chan', site=SITE, chi0=0.3, project_tm=False)
+    F = np.asarray(gp.F); n = F.shape[1] // 2
+    j = 0; v = gp.pa_labels[0]; m = lab == v; zQ, zU = z[v]
+    assert np.allclose(F[m, j], zQ * np.cos(2 * (psi[m] + 0.3)) + zU * np.sin(2 * (psi[m] + 0.3)), atol=1e-16)
+    assert np.allclose(F[m, n + j], -zQ * np.sin(2 * (psi[m] + 0.3)) + zU * np.cos(2 * (psi[m] + 0.3)), atol=1e-16)
+
+
+def test_boost_sampled_chi0_is_callable_and_matches_the_fixed_basis(psr):
+    z = _z(psr, seed=7)
+    var = s.makegp_pa_boost(psr, z, bin_flag='chan', site=SITE, chi0='sample')
+    assert callable(var.F)
+    for c in (-0.5, 0.0, 0.4):
+        fix = s.makegp_pa_boost(psr, z, bin_flag='chan', site=SITE, chi0=c)
+        assert np.allclose(np.asarray(var.F({f'{psr.name}_pa_boost_chi0': c})), np.asarray(fix.F), atol=1e-16)
+
+
+def test_boost_prior_is_kron_of_the_two_by_two_covariance(psr):
+    """Phi = I_nchan (x) D R D in the [X | Y] column order, for the three variants."""
+    z = _z(psr, seed=8)
+    for variant in ('iso', 'diag', 'full'):
+        gp = s.makegp_pa_boost(psr, z, bin_flag='chan', site=SITE, variant=variant, project_tm=False)
+        n = np.asarray(gp.F).shape[1] // 2
+        base = f'{psr.name}_pa_boost'
+        pars = ({f'{base}_log10_sigma': -2.0} if variant == 'iso' else
+                {f'{base}_log10_sigma_X': -2.0, f'{base}_log10_sigma_Y': -3.0})
+        if variant == 'full':
+            pars[f'{base}_rho_XY'] = 0.4
+        Phi = np.asarray(gp.Phi.getN(pars))
+        sX = 1e-2; sY = 1e-2 if variant == 'iso' else 1e-3; r = 0.4 if variant == 'full' else 0.0
+        M = np.array([[sX * sX, r * sX * sY], [r * sX * sY, sY * sY]])
+        assert np.allclose(Phi, np.kron(M, np.eye(n)), rtol=1e-12)
+        assert sorted(gp.Phi.getN.params if hasattr(gp.Phi.getN, 'params') else gp.Phi.params) == sorted(pars)
+
+
+def test_boost_prior_boxes_are_in_boost_units(psr):
+    import re
+    from discovery import prior
+    s.makegp_pa_boost(psr, _z(psr), bin_flag='chan', site=SITE, variant='full', chi0='sample')
+    e = re.escape(psr.name)
+    assert prior.priordict_standard[f'{e}_pa_boost_log10_sigma_X'] == [-6.0, -1.3]
+    assert prior.priordict_standard[f'{e}_pa_boost_log10_sigma_Y'] == [-6.0, -1.3]
+    assert prior.priordict_standard[f'{e}_pa_boost_rho_XY'] == [-1.0, 1.0]
+    assert prior.priordict_standard[f'{e}_pa_boost_chi0'] == [-0.25 * float(np.pi), 0.25 * float(np.pi)]
+    s.makegp_pa_boost(psr, _z(psr), bin_flag='chan', site=SITE, variant='iso')
+    assert prior.priordict_standard[f'{e}_pa_boost_log10_sigma'] == [-6.0, -1.3]
+
+
+def test_boost_iso_likelihood_is_invariant_under_handedness(psr):
+    """Both hands span the same columns; an isotropic prior makes the two models one."""
+    z = _z(psr, seed=9)
+    rng = np.random.default_rng(1)
+    res = np.asarray(psr.residuals) + rng.normal(scale=np.asarray(psr.toaerrs))
+    out = []
+    for h in (1, -1):
+        gp = s.makegp_pa_boost(psr, z, bin_flag='chan', site=SITE, hand=h, variant='iso')
+        m = dl.PulsarLikelihood([res, s.makenoise_measurement(psr, {}), s.makegp_timing(psr, svd=True), gp])
+        pr = {k: (1.0 if k.endswith('efac') else -2.5 if 'pa_boost' in k else -8.0) for k in m.logL.params}
+        out.append(float(m.logL(pr)))
+    assert abs(out[0] - out[1]) < 1e-6 * max(1.0, abs(out[0]))
+
+
+def test_boost_anisotropic_likelihood_is_not_hand_invariant_when_zU_is_nonzero(psr):
+    """Flipping h maps b to its reflection about the susceptibility direction, which is
+    bY -> -bY only for zU = 0; with zU != 0 an anisotropic prior tells the hands apart."""
+    z = _z(psr, seed=10)
+    rng = np.random.default_rng(2)
+    res = np.asarray(psr.residuals) + rng.normal(scale=np.asarray(psr.toaerrs))
+    out = []
+    for h in (1, -1):
+        gp = s.makegp_pa_boost(psr, z, bin_flag='chan', site=SITE, hand=h, variant='diag')
+        m = dl.PulsarLikelihood([res, s.makenoise_measurement(psr, {}), s.makegp_timing(psr, svd=True), gp])
+        pr = {k: (1.0 if k.endswith('efac') else -2.0 if k.endswith('sigma_X') else -4.0 if k.endswith('sigma_Y')
+                  else -8.0) for k in m.logL.params}
+        out.append(float(m.logL(pr)))
+    assert abs(out[0] - out[1]) > 1e-3
+
+
+def test_boost_era_split_doubles_the_blocks_with_disjoint_rows(psr):
+    z = _z(psr, seed=11)
+    t = np.asarray(getattr(psr, 'stoas', psr.toas)) / 86400.0
+    cut = float(np.median(t))
+    one = s.makegp_pa_boost(psr, z, bin_flag='chan', site=SITE, project_tm=False)
+    two = s.makegp_pa_boost(psr, z, bin_flag='chan', site=SITE, project_tm=False, era_split=cut)
+    F1, F2 = np.asarray(one.F), np.asarray(two.F); n = F1.shape[1]
+    assert F2.shape == (F1.shape[0], 2 * n)
+    early = t < cut
+    assert np.all(F2[~early, :n] == 0.0) and np.all(F2[early, n:] == 0.0)
+    assert np.array_equal(F2[early, :n], F1[early]) and np.array_equal(F2[~early, n:], F1[~early])
+    Phi = np.asarray(two.Phi.getN({f'{psr.name}_pa_boost_log10_sigma_X': -2.0,
+                                   f'{psr.name}_pa_boost_log10_sigma_Y': -2.0,
+                                   f'{psr.name}_pa_boost_rho_XY': 0.0}))
+    assert Phi.shape == (2 * n, 2 * n)
+    with pytest.raises(ValueError, match="leaves an era with no TOAs"):
+        s.makegp_pa_boost(psr, z, bin_flag='chan', site=SITE, era_split=t.min() - 1.0)
+
+
+def test_boost_rejects_bad_susceptibilities(psr):
+    z = _z(psr); z.pop(next(iter(z)))
+    with pytest.raises(KeyError, match="no susceptibility"):
+        s.makegp_pa_boost(psr, z, bin_flag='chan', site=SITE)
+    with pytest.raises(ValueError, match="z must give"):
+        s.makegp_pa_boost(psr, np.zeros((3, 2)), bin_flag='chan', site=SITE)
+    with pytest.raises(ValueError, match="variant must be"):
+        s.makegp_pa_boost(psr, _z(psr), bin_flag='chan', site=SITE, variant='axial')
+    with pytest.raises(ValueError, match="hand must be"):
+        s.makegp_pa_boost(psr, _z(psr), bin_flag='chan', site=SITE, hand=2)
+
+
+def test_single_pulsar_noise_builds_the_boost_gp_and_refuses_both(two_psrs):
+    from discovery.models import mpta
+
+    a = two_psrs[0]
+    m = mpta.single_pulsar_noise(a, fftint=False, pa_boost=True, pa_boost_z=_z(a, seed=12))
+    assert f'{a.name}_pa_boost_log10_sigma_X' in m.logL.params
+    assert f'{a.name}_pa_boost_rho_XY' in m.logL.params
+    assert not any('pa_gp' in p for p in m.logL.params)
+    with pytest.raises(ValueError, match="span the same columns"):
+        mpta.single_pulsar_noise(a, fftint=False, pa_gp=True, pa_boost=True, pa_boost_z=_z(a))
+    with pytest.raises(ValueError, match="needs pa_boost_z"):
+        mpta.single_pulsar_noise(a, fftint=False, pa_boost=True)
+
+
+def test_common_noise_reads_the_boost_variant_from_the_chains(two_psrs):
+    from discovery.models import mpta
+
+    a, b = two_psrs
+    m = mpta.common_noise(two_psrs, [_fake_chain(a, boost='diag'), _fake_chain(b, boost='iso')],
+                          fd=False, pa_bin_flag='chan', noise_point='median',
+                          pa_boost_z={a.name: _z(a, seed=13), b.name: _z(b, seed=14)})
+    got = sorted(p for p in m.logL.params if 'pa_boost' in p)
+    assert got == sorted([f'{a.name}_pa_boost_log10_sigma_X', f'{a.name}_pa_boost_log10_sigma_Y',
+                          f'{b.name}_pa_boost_log10_sigma'])
+    with pytest.raises(ValueError, match="no susceptibilities"):
+        mpta.common_noise(two_psrs, [_fake_chain(a, boost='full'), _fake_chain(b)],
+                          fd=False, pa_bin_flag='chan', noise_point='median')

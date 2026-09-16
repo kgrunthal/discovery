@@ -1633,6 +1633,55 @@ def parallactic_angle(psr, site=None):
                       np.sin(lat) * np.cos(dec) - np.cos(lat) * np.sin(dec) * np.cos(H))
 
 
+def _pa_basis_parts(psr, bin_flag, harmonic, site, project, project_tm, name, what):
+    """Ingredients shared by the parallactic-angle GPs.
+
+    Returns ``(ind, q, psi, Q_null)``: the channel-indicator block and its bin positions
+    from :func:`_fd_constant_block`, the angle from :func:`parallactic_angle`, and an
+    orthonormal basis for the span to remove (timing model, plus any ``project`` bases),
+    or None when nothing is projected.
+    """
+    if int(harmonic) < 1:
+        raise ValueError(f'{what}: harmonic must be a positive integer, '
+                         f'got {harmonic}.')
+    if not bin_flag:
+        raise ValueError(
+            f'{what}: {psr.name} needs bin_flag, the per-TOA flag whose '
+            f'distinct values define the frequency bins. Bins guessed from the '
+            f'frequencies would not be the receiver channelisation the leakage follows.')
+
+    psi = parallactic_angle(psr, site=site)
+
+    x = np.log(np.asarray(psr.freqs, dtype=np.float64))
+    block = _fd_constant_block(psr, x, np.ones(len(x), dtype=bool), None, 'flag',
+                               name, bin_flag, what=what)
+    if block is None:
+        raise ValueError(f'{what}: no usable frequency bins for {psr.name}.')
+    ind, q = block
+
+    Q_null = np.linalg.qr(normalise_tm_basis(psr))[0] if project_tm else None
+
+    if project is not None:
+        parts = project if isinstance(project, (list, tuple)) else [project]
+        mats = []
+        for part in parts:
+            F_p = getattr(part, 'F', part)
+            if callable(F_p):
+                raise ValueError(
+                    f'{what}: {psr.name}: a basis passed to project has a '
+                    f'callable F, so it has no fixed column span to remove. Only bases '
+                    f'with a constant design matrix can be projected out.')
+            mats.append(np.asarray(F_p, dtype=np.float64))
+        P = np.hstack(mats)
+        if Q_null is not None:
+            P = P - Q_null @ (Q_null.T @ P)
+        Up, Sp, _ = np.linalg.svd(P, full_matrices=False)
+        keep = Up[:, Sp > 1e-10 * Sp[0]]
+        Q_null = keep if Q_null is None else np.hstack([Q_null, keep])
+
+    return ind, q, psi, Q_null
+
+
 def makegp_pa_quadrature(psr, bin_flag='chan', harmonic=2, site=None,
                          project=None, project_tm=True, name='pa_gp'):
     """Delay locked to a harmonic of the parallactic angle, per frequency channel.
@@ -1687,47 +1736,12 @@ def makegp_pa_quadrature(psr, bin_flag='chan', harmonic=2, site=None,
     """
     from . import prior as _prior
 
+    ind, q, psi, Q_null = _pa_basis_parts(psr, bin_flag, harmonic, site, project,
+                                          project_tm, name, 'makegp_pa_quadrature')
     harmonic = int(harmonic)
-    if harmonic < 1:
-        raise ValueError(f'makegp_pa_quadrature: harmonic must be a positive integer, '
-                         f'got {harmonic}.')
-    if not bin_flag:
-        raise ValueError(
-            f'makegp_pa_quadrature: {psr.name} needs bin_flag, the per-TOA flag whose '
-            f'distinct values define the frequency bins. Bins guessed from the '
-            f'frequencies would not be the receiver channelisation the leakage follows.')
-
-    psi = parallactic_angle(psr, site=site)
-
-    x = np.log(np.asarray(psr.freqs, dtype=np.float64))
-    block = _fd_constant_block(psr, x, np.ones(len(x), dtype=bool), None, 'flag',
-                               name, bin_flag, what='makegp_pa_quadrature')
-    if block is None:
-        raise ValueError(f'makegp_pa_quadrature: no usable frequency bins for {psr.name}.')
-    ind, q = block
 
     fmat = np.hstack([ind * np.sin(harmonic * psi)[:, None],
                       ind * np.cos(harmonic * psi)[:, None]])
-
-    Q_null = np.linalg.qr(normalise_tm_basis(psr))[0] if project_tm else None
-
-    if project is not None:
-        parts = project if isinstance(project, (list, tuple)) else [project]
-        mats = []
-        for part in parts:
-            F_p = getattr(part, 'F', part)
-            if callable(F_p):
-                raise ValueError(
-                    f'makegp_pa_quadrature: {psr.name}: a basis passed to project has a '
-                    f'callable F, so it has no fixed column span to remove. Only bases '
-                    f'with a constant design matrix can be projected out.')
-            mats.append(np.asarray(F_p, dtype=np.float64))
-        P = np.hstack(mats)
-        if Q_null is not None:
-            P = P - Q_null @ (Q_null.T @ P)
-        Up, Sp, _ = np.linalg.svd(P, full_matrices=False)
-        keep = Up[:, Sp > 1e-10 * Sp[0]]
-        Q_null = keep if Q_null is None else np.hstack([Q_null, keep])
 
     if Q_null is not None:
         before = np.linalg.svd(fmat, compute_uv=False)
@@ -1759,6 +1773,298 @@ def makegp_pa_quadrature(psr, bin_flag='chan', harmonic=2, site=None,
     gp.pa_harmonic = harmonic
     gp.pa_bins = np.exp(q)
     gp.pa_angle = psi
+
+    return gp
+
+
+def makegp_pa_common_phase(psr, bin_flag='chan', harmonic=2, site=None, project=None,
+                           project_tm=True, phase=None, name='pa_gp'):
+    """Delay locked to a harmonic of the parallactic angle, one phase across channels.
+
+    The restriction of :func:`makegp_pa_quadrature` to a phase shared by every channel:
+    each channel carries one signed amplitude on the single quadrature::
+
+        column c:   F[i] = 1[chan_i = c] sin(m psi_i + theta)
+
+    giving ``n_chan`` columns whose coefficients are the channel amplitudes in seconds.
+    ``psi`` is :func:`parallactic_angle`: ``tan(psi) = sin(H) cos(phi) / [sin(phi) cos(dec)
+    - cos(phi) sin(dec) cos(H)]`` in ``(-pi, pi]``, so ``theta`` flips sign with ``psi``.
+    A signed amplitude makes ``theta`` and ``theta + pi`` the same model, so ``theta``
+    is sampled on ``[-pi/2, pi/2)`` as ``{psr}_{name}_phase``, in radians; ``F`` is
+    callable unless ``phase`` fixes it.
+
+    The coefficients carry ``Phi = sigma**2 I``, sampling ``{psr}_{name}_log10_sigma``
+    in seconds on ``[-10, -6]``; a channel of amplitude a has ``E[a**2] = sigma**2``,
+    against ``2 sigma**2`` for the two-quadrature model. The basis is not
+    orthonormalised, as for :func:`makegp_pa_quadrature`.
+
+    psr:        Discovery Pulsar object
+    bin_flag:   per-TOA flag whose distinct values define the frequency bins
+    harmonic:   multiple of the parallactic angle to model
+    site:       observing site, passed to :func:`parallactic_angle`
+    project:    further bases to remove alongside the timing model, each an array or a
+                GP with a non-callable ``F``
+    project_tm: remove the timing-model column span
+    phase:      fixed value of ``theta`` in radians; None samples it
+    name:       base name for the GP parameters
+    """
+    from . import prior as _prior
+
+    ind, q, psi, Q_null = _pa_basis_parts(psr, bin_flag, harmonic, site, project,
+                                          project_tm, name, 'makegp_pa_common_phase')
+    harmonic = int(harmonic)
+    ncol = ind.shape[1]
+
+    sinm = ind * np.sin(harmonic * psi)[:, None]
+    cosm = ind * np.cos(harmonic * psi)[:, None]
+    if Q_null is not None:
+        S = sinm - Q_null @ (Q_null.T @ sinm)
+        C = cosm - Q_null @ (Q_null.T @ cosm)
+        ranks, kept = [], []
+        for theta in (0.0, np.pi / 4, np.pi / 2, 3 * np.pi / 4):
+            F = S * np.cos(theta) + C * np.sin(theta)
+            raw = sinm * np.cos(theta) + cosm * np.sin(theta)
+            sv = np.linalg.svd(F, compute_uv=False)
+            ranks.append(int(np.sum(sv > 1e-8 * sv[0])) if sv[0] > 0 else 0)
+            kept.append(np.sum(F**2) / np.sum(raw**2))
+        print(f'makegp_pa_common_phase: {psr.name} {name}: {ncol} columns over {ncol} '
+              f'bin(s) at {harmonic} x PA with one phase; over four phases the projection '
+              f'leaves rank {min(ranks)}-{max(ranks)}, retaining {min(kept):.4f}-{max(kept):.4f} '
+              f'of the basis power.')
+        if min(ranks) < ncol:
+            print(f'Warning: makegp_pa_common_phase: {psr.name} {name}: the projection '
+                  f'annihilates up to {ncol - min(ranks)} direction(s), which stay in the '
+                  f'basis and integrate back to their prior rather than being dropped, '
+                  f'so the marginal likelihood is unaffected.')
+    else:
+        S, C = sinm, cosm
+
+    signame = f'{psr.name}_{name}_log10_sigma'
+    phname = f'{psr.name}_{name}_phase'
+    ones = matrix.jnparray(np.ones(ncol))
+
+    def getphi(params):
+        return 10.0**(2.0 * params[signame]) * ones
+    getphi.params = [signame]
+
+    _prior.priordict_standard.update(
+        {f'{re.escape(psr.name)}_{name}_log10_sigma': [-10.0, -6.0]})
+
+    if phase is not None:
+        fmat = S * np.cos(float(phase)) + C * np.sin(float(phase))
+    else:
+        _prior.priordict_standard.update(
+            {f'{re.escape(psr.name)}_{name}_phase': [-0.5 * float(np.pi), 0.5 * float(np.pi)]})
+        S_j, C_j = matrix.jnparray(S), matrix.jnparray(C)
+
+        def fmat(params):
+            theta = params[phname]
+            return S_j * jnp.cos(theta) + C_j * jnp.sin(theta)
+        fmat.params = [phname]
+
+    gp = matrix.VariableGP(matrix.NoiseMatrix1D_var(getphi), fmat)
+    gp.index = {f'{psr.name}_{name}_coefficients({ncol})': slice(0, ncol)}
+    gp.name, gp.pos, gp.gpname, gp.gpcommon = psr.name, psr.pos, name, []
+    gp.pa_harmonic = harmonic
+    gp.pa_bins = np.exp(q)
+    gp.pa_angle = psi
+    gp.pa_phase = phase
+
+    return gp
+
+def makegp_pa_boost(psr, z, bin_flag='chan', hand=1, chi0=0.0, variant='full', era_split=None,
+                    site=None, project=None, project_tm=True, name='pa_boost'):
+    """Polarimetric boost delay, with coefficients in dimensionless boost units.
+
+    A Hermitian instrumental distortion with boost vector ``b = (bX, bY, bZ)`` in the
+    antenna frame changes the total intensity to first order as ``S0' = S0 + 2 b . S_ant``
+    (van Straten 2013, eq. 3, |b| << 1), so a differential gain error of 1 per cent is
+    ``bX = 0.005``; the coefficients here are ``b``, not ``2b``. Antenna-frame Stokes are
+    the celestial-frame (IAU, Britton 2000) ones rotated by twice the parallactic angle,
+    with handedness ``h`` (Zahraoui et al., PIB eq. 5)::
+
+        Q_ant =  Q cos 2h psi + U sin 2h psi
+        U_ant = -Q sin 2h psi + U cos 2h psi
+        V_ant =  V
+
+    The ToA responds through the susceptibilities ``z = (zQ, zU, zV)`` of each channel,
+    in seconds per unit boost, positive when a positive boost delays the ToA: fixed
+    inputs computed from the Stokes template, not here. For TOA i in channel k::
+
+        dX_i =  zQ[k] cos 2h psi_i + zU[k] sin 2h psi_i
+        dY_i = -zQ[k] sin 2h psi_i + zU[k] cos 2h psi_i
+        delay_i = bX[k] dX_i + bY[k] dY_i
+
+    The basis is ``[F_FD * dX | F_FD * dY]``, ``F_FD`` the channel indicators, ``2 n_chan``
+    columns. ``dZ = zV[k]`` is constant in time within a channel and shares its column
+    space with the FD basis, so no Z block is built: an FD coefficient ``c_k`` contains
+    ``bZ[k] zV[k]``.
+
+    ``psi`` is :func:`parallactic_angle`: ``atan2(sin H cos phi_site, sin phi_site cos dec
+    - cos phi_site sin dec cos H)`` in ``(-pi, pi]``, positive east of the meridian and
+    zero at upper culmination, per TOA. ``chi0`` offsets the receptor basis,
+    ``psi -> psi + chi0``; ``chi0='sample'`` samples it on ``[-pi/4, pi/4)`` as
+    ``{psr}_{name}_chi0``, and the basis is then callable.
+
+    Prior ``Phi = I (x) M`` over the channels, ``M = D R D``, ``D = diag(sigmaX, sigmaY)``,
+    ``R = [[1, rho], [rho, 1]]`` (the n = 2 partial-correlation construction of the
+    correlated Legendre ECORR), in boost units with no normalisation after projection.
+    ``variant='full'`` samples ``{psr}_{name}_log10_sigma_X`` and ``_log10_sigma_Y`` on
+    ``[-6, -1.3]`` and ``_rho_XY`` on ``[-1, 1]``; ``'diag'`` fixes ``rho = 0``; ``'iso'``
+    sets ``sigmaX = sigmaY`` as ``{psr}_{name}_log10_sigma`` with ``rho = 0``.
+
+    ``era_split`` (an MJD in site time) gives each era its own coefficient set under the
+    shared prior, doubling the blocks. Projections are those of
+    :func:`makegp_pa_quadrature`, applied once to the quadrature blocks, of which ``dX``
+    and ``dY`` are per-channel combinations.
+
+    z:          mapping ``{bin label: (zQ, zU[, zV])}``, or an array ``(n_chan, 2 or 3)`` in
+                the order of the sorted ``bin_flag`` values; seconds per unit boost
+    bin_flag:   per-TOA flag whose distinct values define the channels
+    hand:       ``+1`` or ``-1``
+    chi0:       receptor-basis offset in radians, or ``'sample'``
+    variant:    ``'full'``, ``'diag'`` or ``'iso'``
+    era_split:  MJD splitting the coefficient sets, or None
+    site, project, project_tm, name: as for :func:`makegp_pa_quadrature`
+    """
+    from . import prior as _prior
+
+    if variant not in ('full', 'diag', 'iso'):
+        raise ValueError(f"makegp_pa_boost: variant must be 'full', 'diag' or 'iso', got {variant!r}.")
+    hand = int(hand)
+    if hand not in (1, -1):
+        raise ValueError(f'makegp_pa_boost: hand must be +1 or -1, got {hand}.')
+    sample_chi0 = isinstance(chi0, str)
+    if sample_chi0 and chi0 != 'sample':
+        raise ValueError(f"makegp_pa_boost: chi0 must be a number or 'sample', got {chi0!r}.")
+
+    ind, q, psi, Q_null = _pa_basis_parts(psr, bin_flag, 2, site, project, project_tm, name,
+                                          'makegp_pa_boost')
+    ncol = ind.shape[1]
+    labels = [lab for lab, m in _fd_flag_masks(psr, np.ones(len(psi), dtype=bool), name,
+                                               bin_flag, 'makegp_pa_boost') if m.any()]
+    if len(labels) != ncol:
+        raise ValueError(f'makegp_pa_boost: {psr.name}: {len(labels)} bin labels for '
+                         f'{ncol} basis columns.')
+
+    if isinstance(z, dict):
+        missing = [lab for lab in labels if lab not in z]
+        if missing:
+            raise KeyError(f'makegp_pa_boost: {psr.name}: no susceptibility for '
+                           f'{bin_flag!r} bin(s) {missing}.')
+        zarr = np.array([np.asarray(z[lab], dtype=np.float64)[:3] for lab in labels])
+    else:
+        zarr = np.asarray(z, dtype=np.float64)
+    if zarr.ndim != 2 or zarr.shape[0] != ncol or zarr.shape[1] not in (2, 3):
+        raise ValueError(f'makegp_pa_boost: {psr.name}: z must give (zQ, zU[, zV]) for each '
+                         f'of the {ncol} bins, got shape {zarr.shape}.')
+    if not np.all(np.isfinite(zarr[:, :2])):
+        raise ValueError(f'makegp_pa_boost: {psr.name}: zQ and zU must be finite.')
+    zQ, zU = zarr[:, 0], zarr[:, 1]
+    zV = zarr[:, 2] if zarr.shape[1] == 3 else np.full(ncol, np.nan)
+
+    S = ind * np.sin(2.0 * psi)[:, None]
+    C = ind * np.cos(2.0 * psi)[:, None]
+    if era_split is not None:
+        t = np.asarray(getattr(psr, 'stoas', psr.toas), dtype=np.float64) / 86400.0
+        early = t < float(era_split)
+        if early.all() or not early.any():
+            raise ValueError(f'makegp_pa_boost: {psr.name}: era_split={era_split} leaves an '
+                             f'era with no TOAs.')
+        eras = [(S * early[:, None], C * early[:, None]),
+                (S * ~early[:, None], C * ~early[:, None])]
+    else:
+        eras = [(S, C)]
+
+    def proj(F):
+        return F if Q_null is None else F - Q_null @ (Q_null.T @ F)
+    eras = [(proj(S_), proj(C_)) for S_, C_ in eras]
+    nera = len(eras)
+    ntot = 2 * ncol * nera
+
+    def combine(S_, C_, cos_a, sin_a, xp):
+        Sh = hand * S_
+        cp = C_ * cos_a - Sh * sin_a
+        sp = Sh * cos_a + C_ * sin_a
+        return xp.hstack([cp * zQ + sp * zU, -sp * zQ + cp * zU])
+
+    def basis_np(offset):
+        a = 2.0 * hand * offset
+        return np.hstack([combine(S_, C_, np.cos(a), np.sin(a), np) for S_, C_ in eras])
+
+    F0 = basis_np(0.0 if sample_chi0 else float(chi0))
+    if Q_null is not None:
+        raw = np.hstack([combine(S_, C_, 1.0, 0.0, np) for S_, C_ in
+                         ([(S, C)] if era_split is None else
+                          [(S * early[:, None], C * early[:, None]),
+                           (S * ~early[:, None], C * ~early[:, None])])])
+        sv = np.linalg.svd(F0, compute_uv=False)
+        rank = int(np.sum(sv > 1e-8 * sv[0])) if sv[0] > 0 else 0
+        print(f'makegp_pa_boost: {psr.name} {name}: {ntot} columns over {ncol} bin(s)'
+              f'{f" and {nera} eras" if nera > 1 else ""}, hand {hand:+d}; projection leaves '
+              f'rank {rank}, retaining {np.sum(F0**2) / np.sum(raw**2):.4f} of the basis power.')
+        if rank < ntot:
+            print(f'Warning: makegp_pa_boost: {psr.name} {name}: the projection annihilates '
+                  f'{ntot - rank} direction(s), which stay in the basis and integrate back '
+                  f'to their prior rather than being dropped.')
+
+    if variant == 'iso':
+        sxname = syname = f'{psr.name}_{name}_log10_sigma'
+        names = [sxname]
+    else:
+        sxname, syname = f'{psr.name}_{name}_log10_sigma_X', f'{psr.name}_{name}_log10_sigma_Y'
+        names = [sxname, syname]
+    rhoname = f'{psr.name}_{name}_rho_XY'
+    if variant == 'full':
+        names.append(rhoname)
+    eye_c, eye_e = matrix.jnparray(np.eye(ncol)), matrix.jnparray(np.eye(nera))
+
+    def getphi(params):
+        sX = 10.0 ** params[sxname]
+        sY = 10.0 ** params[syname]
+        r = params[rhoname] if variant == 'full' else 0.0
+        M = jnp.array([[sX * sX, r * sX * sY], [r * sX * sY, sY * sY]])
+        return jnp.kron(eye_e, jnp.kron(M, eye_c))
+    getphi.params = list(names)
+
+    boxes = {f'{re.escape(n)}': [-6.0, -1.3] for n in dict.fromkeys([sxname, syname])}
+    if variant == 'full':
+        boxes[re.escape(rhoname)] = [-1.0, 1.0]
+    chiname = f'{psr.name}_{name}_chi0'
+    if sample_chi0:
+        boxes[re.escape(chiname)] = [-0.25 * float(np.pi), 0.25 * float(np.pi)]
+    _prior.priordict_standard.update(boxes)
+
+    if sample_chi0:
+        eras_j = [(matrix.jnparray(S_), matrix.jnparray(C_)) for S_, C_ in eras]
+        zQ_j, zU_j = matrix.jnparray(zQ), matrix.jnparray(zU)
+
+        def combine_j(S_, C_, a):
+            Sh = hand * S_
+            cp = C_ * jnp.cos(a) - Sh * jnp.sin(a)
+            sp = Sh * jnp.cos(a) + C_ * jnp.sin(a)
+            return jnp.hstack([cp * zQ_j + sp * zU_j, -sp * zQ_j + cp * zU_j])
+
+        def fmat(params):
+            a = 2.0 * hand * params[chiname]
+            return jnp.hstack([combine_j(S_, C_, a) for S_, C_ in eras_j])
+        fmat.params = [chiname]
+    else:
+        fmat = F0
+
+    gp = matrix.VariableGP(matrix.NoiseMatrix2D_var(getphi), fmat)
+    gp.index = {f'{psr.name}_{name}_coefficients({ntot})': slice(0, ntot)}
+    gp.name, gp.pos, gp.gpname, gp.gpcommon = psr.name, psr.pos, name, []
+    gp.pa_harmonic = 2
+    gp.pa_bins = np.exp(q)
+    gp.pa_labels = labels
+    gp.pa_angle = psi
+    gp.pa_hand = hand
+    gp.pa_chi0 = None if sample_chi0 else float(chi0)
+    gp.pa_variant = variant
+    gp.pa_z = np.column_stack([zQ, zU, zV])
+    gp.pa_era_split = era_split
+    gp.pa_delta = None if sample_chi0 else (F0[:, :ncol].sum(axis=1), F0[:, ncol:2 * ncol].sum(axis=1))
 
     return gp
 
