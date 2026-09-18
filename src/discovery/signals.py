@@ -1682,7 +1682,7 @@ def _pa_basis_parts(psr, bin_flag, harmonic, site, project, project_tm, name, wh
     return ind, q, psi, Q_null
 
 
-def makegp_pa_quadrature(psr, bin_flag='chan', harmonic=2, site=None,
+def makegp_pa_free_phase(psr, bin_flag='chan', harmonic=2, site=None,
                          project=None, project_tm=True, variant='iso', name='pa_gp'):
     """Delay locked to a harmonic of the parallactic angle, per frequency channel.
 
@@ -1698,8 +1698,8 @@ def makegp_pa_quadrature(psr, bin_flag='chan', harmonic=2, site=None,
     elevation-dependent deformation, and belongs in its own component rather than here.
 
     The basis is the channel-indicator basis of :func:`makegp_fd_piecewise` with
-    ``kind='constant'`` and ``spacing='flag'``, multiplied row-wise by the two
-    quadratures::
+    ``kind='constant'`` and ``spacing='flag'``, multiplied row-wise by the sine and the
+    cosine of the angle::
 
         column (c, sin):   F[i] = 1[chan_i = c] sin(m psi_i)
         column (c, cos):   F[i] = 1[chan_i = c] cos(m psi_i)
@@ -1718,7 +1718,7 @@ def makegp_pa_quadrature(psr, bin_flag='chan', harmonic=2, site=None,
     ``_rho_XY`` on ``[-1, 1]``; both give ``E[A**2] = sigma_X**2 + sigma_Y**2`` and a
     phase drawn from an ellipse. Shifting the origin of ``psi`` rotates the coefficient
     pair, so only ``'iso'`` and ``'full'`` are closed under it: ``'diag'`` pins the
-    ellipse to the quadratures, and ``rho -> +-1`` is
+    ellipse to the sine and cosine axes, and ``rho -> +-1`` is
     :func:`makegp_pa_common_phase`.
 
     The basis is not orthonormalised, and the projections are applied to the design
@@ -1734,8 +1734,8 @@ def makegp_pa_quadrature(psr, bin_flag='chan', harmonic=2, site=None,
     harmonic:   multiple of the parallactic angle to model
     site:       observing site, passed to :func:`parallactic_angle`
     project:    further bases to remove alongside the timing model, each an array or a
-                GP with a non-callable ``F``. The quadratures have a non-zero mean
-                within a channel, so each column here overlaps the corresponding channel
+                GP with a non-callable ``F``. Both columns of a channel have a non-zero
+                mean within it, so each overlaps the corresponding channel
                 indicator of a piecewise-constant FD basis; pass that GP here to remove
                 the overlap
     project_tm: remove the timing-model column span
@@ -1745,7 +1745,7 @@ def makegp_pa_quadrature(psr, bin_flag='chan', harmonic=2, site=None,
     from . import prior as _prior
 
     ind, q, psi, Q_null = _pa_basis_parts(psr, bin_flag, harmonic, site, project,
-                                          project_tm, name, 'makegp_pa_quadrature')
+                                          project_tm, name, 'makegp_pa_free_phase')
     harmonic = int(harmonic)
 
     fmat = np.hstack([ind * np.sin(harmonic * psi)[:, None],
@@ -1756,17 +1756,17 @@ def makegp_pa_quadrature(psr, bin_flag='chan', harmonic=2, site=None,
         fmat = fmat - Q_null @ (Q_null.T @ fmat)
         after = np.linalg.svd(fmat, compute_uv=False)
         rank = int(np.sum(after > 1e-8 * after[0])) if after[0] > 0 else 0
-        print(f'makegp_pa_quadrature: {psr.name} {name}: {fmat.shape[1]} columns over '
+        print(f'makegp_pa_free_phase: {psr.name} {name}: {fmat.shape[1]} columns over '
               f'{ind.shape[1]} bin(s) at {harmonic} x PA; projection leaves rank {rank}, '
               f'retaining {np.sum(after**2) / np.sum(before**2):.4f} of the basis power.')
         if rank < fmat.shape[1]:
-            print(f'Warning: makegp_pa_quadrature: {psr.name} {name}: the projection '
+            print(f'Warning: makegp_pa_free_phase: {psr.name} {name}: the projection '
                   f'annihilates {fmat.shape[1] - rank} direction(s), which stay in the '
                   f'basis and integrate back to their prior rather than being dropped, '
                   f'so the marginal likelihood is unaffected.')
 
     if variant not in ('iso', 'diag', 'full'):
-        raise ValueError(f"makegp_pa_quadrature: variant must be 'iso', 'diag' or 'full', "
+        raise ValueError(f"makegp_pa_free_phase: variant must be 'iso', 'diag' or 'full', "
                          f"got {variant!r}.")
     nbin = ind.shape[1]
 
@@ -1816,12 +1816,15 @@ def makegp_pa_quadrature(psr, bin_flag='chan', harmonic=2, site=None,
     return gp
 
 
+makegp_pa_quadrature = makegp_pa_free_phase
+
+
 def makegp_pa_common_phase(psr, bin_flag='chan', harmonic=2, site=None, project=None,
                            project_tm=True, phase=None, name='pa_gp'):
     """Delay locked to a harmonic of the parallactic angle, one phase across channels.
 
-    The restriction of :func:`makegp_pa_quadrature` to a phase shared by every channel:
-    each channel carries one signed amplitude on the single quadrature::
+    The restriction of :func:`makegp_pa_free_phase` to a phase shared by every channel:
+    each channel carries one signed amplitude on the single sinusoid::
 
         column c:   F[i] = 1[chan_i = c] sin(m psi_i + theta)
 
@@ -1834,8 +1837,8 @@ def makegp_pa_common_phase(psr, bin_flag='chan', harmonic=2, site=None, project=
 
     The coefficients carry ``Phi = sigma**2 I``, sampling ``{psr}_{name}_log10_sigma``
     in seconds on ``[-10, -6]``; a channel of amplitude a has ``E[a**2] = sigma**2``,
-    against ``2 sigma**2`` for the two-quadrature model. The basis is not
-    orthonormalised, as for :func:`makegp_pa_quadrature`.
+    against ``2 sigma**2`` for the free-phase model. The basis is not
+    orthonormalised, as for :func:`makegp_pa_free_phase`.
 
     psr:        Discovery Pulsar object
     bin_flag:   per-TOA flag whose distinct values define the frequency bins
@@ -1954,8 +1957,8 @@ def makegp_pa_boost(psr, z, bin_flag='chan', hand=1, chi0=0.0, variant='full', e
 
     ``era_split`` (an MJD in site time) gives each era its own coefficient set under the
     shared prior, doubling the blocks. Projections are those of
-    :func:`makegp_pa_quadrature`, applied once to the quadrature blocks, of which ``dX``
-    and ``dY`` are per-channel combinations.
+    :func:`makegp_pa_free_phase`, applied once to the sine and cosine blocks, of which
+    ``dX`` and ``dY`` are per-channel combinations.
 
     z:          mapping ``{bin label: (zQ, zU[, zV])}``, or an array ``(n_chan, 2 or 3)`` in
                 the order of the sorted ``bin_flag`` values; seconds per unit boost
@@ -1964,7 +1967,7 @@ def makegp_pa_boost(psr, z, bin_flag='chan', hand=1, chi0=0.0, variant='full', e
     chi0:       receptor-basis offset in radians, or ``'sample'``
     variant:    ``'full'``, ``'diag'`` or ``'iso'``
     era_split:  MJD splitting the coefficient sets, or None
-    site, project, project_tm, name: as for :func:`makegp_pa_quadrature`
+    site, project, project_tm, name: as for :func:`makegp_pa_free_phase`
     """
     from . import prior as _prior
 

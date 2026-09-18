@@ -1073,7 +1073,7 @@ def single_pulsar_noise(
 
     # Built after fd_gp because pa_project_fd removes the fd column span from the basis.
     if pa_gp:
-        ppta_gps += [signals.makegp_pa_quadrature(
+        ppta_gps += [signals.makegp_pa_free_phase(
             psr, bin_flag=pa_bin_flag, name='pa_gp',
             project=fd_gp if (pa_project_fd and fd_gp is not None) else None)]
 

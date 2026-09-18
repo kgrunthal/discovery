@@ -334,7 +334,7 @@ def make_psr_gps_fourier(psr, max_cadence_days=14, bkgrnd_log10_A=None, Tspan=No
             ([signals.makegp_fourier(psr, signals.powerlaw, components=psr_components, T=psr_Tspan, fourierbasis=signals.fourierbasis_band_alpha, name='bandalpha_gp')] if band_alpha else []))
 
 
-def make_psr_gps_fftint(psr, max_cadence_days=14, bkgrnd_log10_A=None, Tspan=None, background=True, red=True, red2=False, dm=True, chrom=True, chrom_alpha=None, chrom_fref=1400.0, chrom_poly=True, sw=True, sw_powerlaw=False, sw_qp=False, band=False, band_alpha=False, band_bw_min=20.0, turnover=None, fd_gp=None):
+def make_psr_gps_fftint(psr, max_cadence_days=14, bkgrnd_log10_A=None, Tspan=None, background=True, red=True, red2=False, dm=True, chrom=True, chrom_alpha=None, chrom_fref=1400.0, chrom_poly=True, sw=True, sw_powerlaw=False, sw_qp=False, sw_fourier=False, band=False, band_alpha=False, band_bw_min=20.0, turnover=None, fd_gp=None):
     psr_Tspan = signals.getspan(psr) if Tspan is None else Tspan
     psr_components = (signals.psr_components(psr.toas, dt=1.0, Tspan=psr_Tspan) if max_cadence_days is None
                       else int(psr_Tspan / (max_cadence_days * 86400)))
@@ -350,7 +350,13 @@ def make_psr_gps_fftint(psr, max_cadence_days=14, bkgrnd_log10_A=None, Tspan=Non
             ([signals.makegp_chrom_poly_svd(psr, name='chrom_gp', project=fd_gp, noisedict=_chrom_poly_noisedict(psr, chrom_alpha))] if chrom_poly else []) + \
             # Solar wind: time-domain GP by default, quasi-periodic when sw_qp=True and squared-exponential otherwise, or the power-law (FFT-covariance) GP when sw_powerlaw=True (legacy treatment).
             ([solar.makegp_timedomain_solar_dm(psr, covariance=(signals.make_quasi_periodic(SW_QP_LOG10_P) if sw_qp else signals.squared_exponential), dt=SW_DT, name='sw_gp')] if (sw and not sw_powerlaw) else []) + \
-            ([signals.makegp_fftcov_solar(psr, signals.powerlaw, components=psr_knots, T=psr_Tspan, name='sw_gp')] if (sw and sw_powerlaw) else []) + \
+            ([signals.makegp_fftcov_solar(psr, signals.powerlaw, components=psr_knots, T=psr_Tspan, name='sw_gp')] if (sw and sw_powerlaw and not sw_fourier) else []) + \
+            # sw_fourier keeps the red/DM/chromatic GPs on the fftInt time-integral covariance
+            # and puts the solar-wind GP alone on the truncated Fourier basis: 2C sin/cos columns
+            # scaled by the 1/r^2 solar DM signature, against fftcov_solar's dense Toeplitz prior
+            # on a 2C+1-knot time-interpolation basis. Both expose sw_gp_log10_A and sw_gp_gamma,
+            # so the CALLER must tag the two apart -- the parameter names cannot.
+            ([signals.makegp_fourier(psr, signals.powerlaw, components=psr_components, T=psr_Tspan, fourierbasis=solar.make_fourierbasis_solar_dm(logf=False), name='sw_gp')] if (sw and sw_powerlaw and sw_fourier) else []) + \
             ([signals.makegp_fftcov_band(psr, signals.powerlaw, components=psr_knots, T=psr_Tspan, name='band_gp')] if band else []) + \
             ([signals.makegp_fftcov_band_alpha(psr, signals.powerlaw, components=psr_knots, T=psr_Tspan, name='bandalpha_gp')] if band_alpha else []))
 
@@ -358,7 +364,7 @@ def make_psr_gps_fftint(psr, max_cadence_days=14, bkgrnd_log10_A=None, Tspan=Non
 def single_pulsar_noise(psr, fftint=True, max_cadence_days=14, Tspan=None, noisedict={},
                         white_selection=None, # per-TOA flag whose values split efac and tnequad, e.g. 'chan' for one pair per frequency channel. ECORR is deliberately NOT split: each epoch-channel is a singleton, so a per-channel ECORR would give one basis column per TOA
                         ecorr=True, quadratic=False, ecorr_nmodes=None, ecorr_correlated=False, global_ecorr=False, ecorr_tobs_scale=False, # ecorr options. ecorr_tobs_scale weights the ECORR basis by sqrt(tobs_ref/tobs), making log10_ecorr the jitter at the reference integration time rather than an average over integrations of unequal length. ecorr_nmodes=N selects an N-mode Legendre ECORR (log-frequency basis; nmodes=1 is standard ECORR); ecorr_correlated=True uses the full-M (correlated-mode) variant that can also model a frequency-asymmetric jitter amplitude
-                        background=True, bkgrnd_log10_A=None, red=True, red2=False, dm=True, chrom=True, chrom_alpha=None, chrom_fref=1400.0, chrom_poly=True, sw=True, sw_powerlaw=False, sw_qp=False, sw_logf=False, turnover=None, # Base model: gwb, red, dm, chromatic, solar wind (sw_powerlaw=True selects the legacy power-law solar-wind GP instead of the time-domain one; sw_logf=True log-spaces its frequencies -- Fourier path only)
+                        background=True, bkgrnd_log10_A=None, red=True, red2=False, dm=True, chrom=True, chrom_alpha=None, chrom_fref=1400.0, chrom_poly=True, sw=True, sw_powerlaw=False, sw_qp=False, sw_fourier=False, sw_logf=False, turnover=None, # Base model: gwb, red, dm, chromatic, solar wind (sw_powerlaw=True selects the legacy power-law solar-wind GP instead of the time-domain one; sw_logf=True log-spaces its frequencies -- Fourier path only)
                         band=False, band_alpha=False, band_bw_min=20.0, fd=False, fd_nodes=16, fd_spacing='quantile', fd_selection=None, fd_prior='improper', fd_kind='linear', fd_bin_flag=None, fd_normalise=False, # Additional GP models (fd=True marginalises an arbitrary time-constant frequency-dependent delay over fd_nodes frequency nodes; fd_selection splits it per TOA group; fd_prior selects the improper or the Matern-3/2 prior over the node amplitudes)
                         pa_gp=False, pa_phase='free', pa_variant='iso', pa_bin_flag='chan', pa_project_fd=True, # Delay locked to twice the parallactic angle. pa_phase='free': an amplitude and phase per channel; 'common': one phase across channels, sampled as {psr}_pa_gp_phase in radians, with a signed amplitude per channel; a number fixes that phase. pa_variant sets the prior on the free-phase pair: 'iso' one scale, 'diag' a scale per quadrature, 'full' adding their correlation. pa_project_fd removes the fd column span from the basis
                         pa_boost=False, pa_boost_z=None, pa_boost_variant='full', pa_boost_hand=1, pa_boost_chi0=0.0, pa_boost_era_split=None, # Polarimetric boost delay in boost units (signals.makegp_pa_boost) over the pa_bin_flag channels, needing the per-channel susceptibilities pa_boost_z; shares pa_project_fd. Exclusive with pa_gp, whose column space it spans
@@ -477,7 +483,7 @@ def single_pulsar_noise(psr, fftint=True, max_cadence_days=14, Tspan=None, noise
                              f"free-phase model; the common-phase one carries a single "
                              f"amplitude per channel.")
         if pa_phase == 'free':
-            model_components += [signals.makegp_pa_quadrature(
+            model_components += [signals.makegp_pa_free_phase(
                 psr, bin_flag=pa_bin_flag, name='pa_gp', project=pa_project,
                 variant=pa_variant)]
         elif pa_phase == 'common' or fixed:
@@ -495,7 +501,7 @@ def single_pulsar_noise(psr, fftint=True, max_cadence_days=14, Tspan=None, noise
             # Fourier frequency grid to log-space; sw_logf needs fftint=False.
             print("Warning: sw_logf=True is ignored with fftint=True (the FFT-covariance "
                   "solar GP uses a time-interpolation basis). Use fftint=False.")
-        model_components += make_psr_gps_fftint(psr, max_cadence_days=max_cadence_days, bkgrnd_log10_A=bkgrnd_log10_A, Tspan=Tspan, background=background, red=red, red2=red2, dm=dm, chrom=chrom, chrom_alpha=chrom_alpha, chrom_fref=chrom_fref, chrom_poly=chrom_poly, sw=sw, sw_powerlaw=sw_powerlaw, sw_qp=sw_qp, band=band, band_alpha=band_alpha, band_bw_min=band_bw_min, turnover=turnover, fd_gp=fd_gp)
+        model_components += make_psr_gps_fftint(psr, max_cadence_days=max_cadence_days, bkgrnd_log10_A=bkgrnd_log10_A, Tspan=Tspan, background=background, red=red, red2=red2, dm=dm, chrom=chrom, chrom_alpha=chrom_alpha, chrom_fref=chrom_fref, chrom_poly=chrom_poly, sw=sw, sw_powerlaw=sw_powerlaw, sw_qp=sw_qp, sw_fourier=sw_fourier, band=band, band_alpha=band_alpha, band_bw_min=band_bw_min, turnover=turnover, fd_gp=fd_gp)
     else:
         model_components += make_psr_gps_fourier(psr, max_cadence_days=max_cadence_days, bkgrnd_log10_A=bkgrnd_log10_A, Tspan=Tspan, background=background, red=red, red2=red2, dm=dm, chrom=chrom, chrom_alpha=chrom_alpha, chrom_fref=chrom_fref, chrom_poly=chrom_poly, sw=sw, sw_powerlaw=sw_powerlaw, sw_qp=sw_qp, sw_logf=sw_logf, band=band, band_alpha=band_alpha, band_bw_min=band_bw_min, turnover=turnover, fd_gp=fd_gp)
 
