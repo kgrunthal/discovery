@@ -81,7 +81,7 @@ docs = [
     "pydata-sphinx-theme>=0.15",
     "sphinx-autodoc-typehints>=3.0.1",
     "numpydoc>=1.6",
-    "myst-nb>=1.0",
+    "myst-nb>=1.4.0",
 ]
 
 [project.urls]
