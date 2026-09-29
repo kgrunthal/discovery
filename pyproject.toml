@@ -79,7 +79,7 @@ flow = [
 docs = [
     "sphinx>=7.0",
     "pydata-sphinx-theme>=0.15",
-    "sphinx-autodoc-typehints>=1.25",
+    "sphinx-autodoc-typehints>=3.0.1",
     "numpydoc>=1.6",
     "myst-nb>=1.0",
 ]
