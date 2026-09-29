@@ -48,7 +48,7 @@ test = [
     "flake8",
     "flake8-pyproject",
     "numpyro",
-    "pre-commit==3.8.0",
+    "pre-commit==4.6.2",
     "pylint==3.3.0",
     "pylint_junit",
     "pytest-cov==5.0.0",
