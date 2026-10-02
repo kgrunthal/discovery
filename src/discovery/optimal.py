@@ -863,3 +863,531 @@ def eig2cdf(osxs, eigs, cutoff=1e-6, limit=100, epsabs=1e-9):
             RuntimeWarning, stacklevel=2)
 
     return matrix.jnp.clip(vals, 0.0, 1.0)
+
+
+
+
+
+
+
+class PFOS:
+    def __init__(self, gbl):
+        # list() so a generator gbl.psls is not consumed by the comprehensions below
+        self.psls = list(gbl.psls)
+
+        if len(self.psls) < 2:
+            raise ValueError(f"the OS needs at least two pulsars, got {len(self.psls)}.")
+
+        try:
+            self.gws = [psl.gw for psl in self.psls]
+            self.pos = [matrix.jnparray(psl.gw.pos) for psl in self.psls]
+        except AttributeError:
+            raise AttributeError("I cannot find the common GW GP in the pulsar likelihood objects.")
+
+        gwpars = [par for par in self.gws[0].gpcommon if 'log10_A' in par]
+        if len(gwpars) != 1:
+            raise ValueError("I need exactly one common GW log10_A parameter, found "
+                             f"{gwpars}. The OS amplitude rescaling assumes Phi is "
+                             "proportional to 10^(2 log10_A).")
+        self.gwpar = gwpars[0]
+
+        self.pairs = [(i1, i2) for i1 in range(len(self.pos)) for i2 in range(i1 + 1, len(self.pos))]
+        # concrete, not a cached property: must not first be built inside a jit trace
+        self.angles = matrix.jnparray([matrix.jnp.dot(self.pos[i], self.pos[j])
+                                       for (i, j) in self.pairs])
+
+        # built eagerly, for the same reason as self.angles
+        self._kernelsolves_raw = self._build_kernelsolves()
+        
+        # number of frequencies in the GW 
+        self.nfreq = len(self.gws[0].Phi)
+        
+        # needed for chunkes pair covariance matrix calculation
+        self.max_matrix_chunk = 300
+    
+    
+    # -- Copied from OS -------------------------------------------------------
+    def invalidate(self):
+        """Drop cached kernel solves. Call after replacing ``gbl.residuals``.
+
+        Clears every ``cached_property`` on the class and rebuilds the kernel
+        solves eagerly.
+        """
+        for name, value in vars(type(self)).items():
+            if isinstance(value, functools.cached_property):
+                self.__dict__.pop(name, None)
+
+        self._kernelsolves_raw = self._build_kernelsolves()
+        
+        
+    def _build_kernelsolves(self):
+        """Unprojected kernel solves, built eagerly (see ``invalidate``)."""
+        return [psl.N.make_kernelsolve(psl.y, gw.F)
+                for psl, gw in zip(self.psls, self.gws)]
+
+    @functools.cached_property
+    def kernelsolves(self):
+        """Per-pulsar ``k(params) -> (T^T K^-1 y, T^T K^-1 T)`` with ``T = gw.F``.
+
+        Each kernel supplies its own Woodbury reduction, so the whole nested
+        kernel is marginalised, including constant GPs. ``S`` is PSD-projected
+        here, once, so every consumer shares it; ``validate`` reads
+        ``_kernelsolves_raw`` instead.
+        """
+        def wrap(k):
+            def kernelsolve(params):
+                kv, km = k(params)
+                return kv, _psd(km)
+            kernelsolve.params = k.params
+            return kernelsolve
+
+        return [wrap(k) for k in self._kernelsolves_raw]
+    
+    
+    def _linear_solve(self, X, C, r, s=None, method=None):
+        X = X[:,None] if len(X.shape) == 1 else X
+        r = r[:,None] if len(r.shape) == 1 else r
+
+        
+        if method.lower() == 'diagonal':
+            Cinv = matrix.jnp.diag(1/matrix.jnp.diag(C))
+            fisher = X.T @ Cinv @ X
+            dirty_map = X.T @ Cinv @ r
+            
+        elif method.lower() == 'woodbury':
+            # This method requires 's' = A, the diagonally dominant element of C
+            # For the PTA optimal statistic case, this is just np.diag(sig_ab**2)
+            if s is None:
+                raise ValueError('Woodbury method requires the diagonal components of A to be supplied!')
+            
+            # Use same notation as https://en.wikipedia.org/wiki/Woodbury_matrix_identity
+            A = s
+            K = C - A
+            In = matrix.jnp.eye(A.shape[0])
+        
+            cinv = self._woodbury_inverse(A,In,In,K)
+
+            fisher = X.T @ cinv @ X
+            dirty_map = X.T @ cinv @ r 
+            
+        else:
+            msg = f'Unknown method \'{method}\' for linear solving.'
+            raise NameError(msg)
+        
+        if fisher.size>1:
+            cov = matrix.jnp.linalg.pinv(fisher)
+        else:
+            cov = 1/fisher
+        
+        theta = cov.T @ dirty_map
+        return theta, cov
+            
+            
+    def _woodbury_inverse(A, U, C, V, ret_cond = False):
+        """A function to compute the inverse of a matrix using the Woodbury matrix identity.
+
+        This function computes the inverse of a matrix using the Woodbury matrix identity 
+        for more stable matrix inverses. The matrix labels are the same as those used 
+        in its wikipedia page (https://en.wikipedia.org/wiki/Woodbury_matrix_identity)
+        This solves the inverse to: (A + UCV)^-1.
+        
+        This function can also solve inverses of the form: (A + K)^-1 where A is a
+        diagonal matrix and K is a dense matrix. To do this, simply set U and C to 
+        the identity matrix and V to K.
+    
+        Args:
+            A (np.ndarray): An invertible nxn matrix
+            U (np.ndarray): A nxk matrix
+            C (np.ndarray): An invertible kxk matrix
+            V (np.ndarray): A kxn matrix
+            ret_cond (bool, optional): Whether to return the condition number of the matrix (C + V A^-1 U)
+
+        Returns:
+            np.ndarray: The inverse of the matrix (A + UCV)^-1
+        """
+
+        Ainv = matrix.jnp.diag( 1/matrix.jnp.diag(A) )
+        Cinv = matrix.jnp.linalg.pinv(C)
+
+        # (A+UCV)^-1 = (A^-1) - A^-1 @ U @ (C^-1 + V @ A^-1 @ U)^-1 @ V @ A^-1
+        CVAU = Cinv + V @ Ainv @ U
+        tot_inv = Ainv - Ainv @ U @ matrix.jnp.linalg.solve(CVAU, V @ Ainv) 
+
+        if ret_cond:
+            return tot_inv, matrix.jnp.linalg.cond(CVAU)
+    
+        return tot_inv
+
+    # -------------------------------------------------------------------------
+    
+    
+    
+    # - PFOS / defiant functions ----------------------------------------------    
+    def _compute_rhok_sigk(self, X, Z, phi, freq, narrowband):
+        """
+        SUMMARY.
+
+        Parameters
+        ----------
+        X : array of X-vectors
+            DESCRIPTION.
+        Z : array of Z-matrices
+            DESCRIPTION.
+        phi : array
+            PSD of the GW
+        freq : int
+            frequency bin at which the PFOS should be computed
+        narrowband : bool
+            decide whether narrowband or wideband PFOS should be used
+
+        Returns
+        -------
+        rhoK, sigk
+        """
+        # ab are the numbers of the pulsars; (ab) is the pair
+        # Compute rho_ab(f_{freq}), sigma_ab(f_{freq}), and normalization_ab(f_{freq})
+        # k == freq= frequency bin
+        
+        a, b = self.pairs[:,0], self.pairs[:,1]
+        
+        phi_til = matrix.jnp.zeros(self.nfreq)  
+        phi_til[freq] = 1
+        phi_til = matrix.jnp.repeat(phi_til,2)
+        phi2 = phi/phi[2*freq]
+        
+        if narrowband:
+            norms_abk = 1/(matrix.jnp.einsum('ijk,ikj->i',phi_til*Z[a],phi_til*Z[b]))
+        else:
+            norms_abk = 1/(matrix.jnp.einsum('ijk,ikj->i',phi_til*Z[a],phi2*Z[b]))
+            
+        rho_abk =  matrix.jnp.sum(X[a] * phi_til * X[b], axis=1) * norms_abk
+        sig_abk =  matrix.jnp.sqrt(matrix.jnp.einsum('ijk,ikj->i', phi_til*Z[a], phi_til*Z[b]) * norms_abk**2)
+
+        #if matrix.jnp.isnan(sig_abk).any():
+        #    print(os_ex.NaNPairwiseError.extended_response())
+        #    raise os_ex.NaNPairwiseError('NaN values pair-wise uncertainties! Are params valid?')
+
+        return rho_abk, sig_abk, norms_abk
+    
+    
+    
+    def compute_PFOS(self, params, orfa, pair_covariance=False, narrowband=False, 
+                     return_pair_vals=True, select_freq=None):
+        
+        Phi = self.gws[0].Phi.getN(params)
+        orf_matrix = orfa(self.angles)
+        k = select_freq
+        X, Z = [], []
+        
+        for ks in self.kernelsolves:
+            kv, km = k(params)
+            X.append(kv)
+            Z.append(km)
+            
+        rho_k, sig_k, norm = self._compute_rhok_sigk(X, Z, Phi, k, narrowband)
+        s_diag = matrix.jnp.diag(sig_k**2)
+        
+        
+        
+        use_tqdm = False
+        if pair_covariance:
+            method = 'woodbury'
+            Sigma = create_PFOS_pair_covariance(Z, Phi, orf_matrix, 
+                                norm, narrowband, k,
+                                use_tqdm, self.max_matrix_chunk)
+        
+        else:
+            method= 'diagonal'
+            Sigma = matrix.jnp.diag(sig_k**2)
+        
+        
+        # compute the PFOS estimates
+        # A = Sk; S = Sks
+        Sk, Sks = self._linear_solve(orf_matrix, Sigma, rho_k, s=s_diag,
+                                  method=method)
+            
+        
+        if return_pair_vals:
+            out = {'Sk': Sk, 'Sks': Sks, 'rho_k': rho_k, 'sig_k': sig_k, 'Sigma': Sigma}
+        
+        else:
+            out = {'Sk': Sk, 'Sks': Sks}
+        
+        return out
+        
+            
+        
+
+
+
+
+
+
+
+
+
+# copied from defiant, translated to jax.numpy
+
+def create_OS_pair_covariance(Z, phihat, phi, orf, norm_ab, use_tqdm=True, max_chunk=300):
+    """Creates the GWB correlated pair covariance matrix for the OS.
+
+    This function uses numpy array indexing shenanigans and numpy vectorized
+    operations to quickly compute the pulsar pair covariance matrix. This function
+    is designed for the OS but can be hacked to work with the PFOS.
+
+    Importantly, this function uses the separate phihat and phi matrices which represent
+    the unit-amplitude spectral model and the total estimated spectral model respectively.
+    Such that phi = A2 * phihat. With this version, you do not need to estimate the ampltidue
+    and instead estimate phi (which enterprise can do easily).
+
+    For the traditional OS, norm_ab = sig_ab**2.
+
+    Args:
+        Z (numpy.ndarray): A N_pulasr array of 2N_frequencies x 2N_frequencies Z matrices from the OS.
+        phihat (numpy.ndarray): A 2N_frequencies array of the unit-amplitude spectral model.
+        phi (numpy.ndarray): A 2N_frequencies array of the estimated spectrum.
+        orf (numpy.ndarray): A N_pulsar x N_pulsar matrix of the ORF for each pair of pulsars.
+        norm_ab (numpy.ndarray): The N_pair array of pair-wise estimator normalizations.
+        use_tqdm (bool): A flag to use the tqdm progress bar. Defaults to True.
+        max_chunk (int): The maximum number of simultaneous matrix calculations. 
+            Works best between 100-1000 but depends on the computer. Defaults to 300.
+
+    Raises:
+        PCOSInteruptError: If the pair covariance calculation is interupted
+
+    Returns:
+        numpy.ndarray: A N_pairs x N_pairs matrix of the final covariance matrix
+    """
+    # Use some pre-calculations to speed up processing
+    npsr = len(Z)
+    nfreq = len(Z[0])//2
+    npair = npsr*(npsr-1)//2
+
+    pairs_idx = matrix.jnp.array(matrix.jnp.triu_indices(npsr,1)).T
+    a,b = pairs_idx[:,0], pairs_idx[:,1]
+
+    # Get pairs of pairs, both the indices of the pairs, and the pulsar indices
+    PoP_idx = matrix.jnp.array(matrix.jnp.triu_indices(npair)).T
+    
+    PoP = matrix.jnp.zeros((len(PoP_idx),4),dtype=int)
+    PoP[:,(0,1)] = pairs_idx[PoP_idx[:,0]] 
+    PoP[:,(2,3)] = pairs_idx[PoP_idx[:,1]]
+
+    # It is also helpful to create some basic filters. From (ab,cd)
+    psr_match = (PoP[:,(0,1)] == PoP[:,(2,3)]) # checks (a==c,b==d)
+    psr_inv_match = (PoP[:,(0,1)] == PoP[:,(3,2)]) # checks (a==d,b==c)
+
+    # It will be faster to pre-compute some quantities
+    # For this, we should compute the Z @ phi @ Z @ phihat and Z @ phihat
+    ZphiZphihat = matrix.jnp.zeros((npsr,npsr, 2*nfreq,2*nfreq))
+    ZphiZphihat[a,b] = phihat*((phi*Z[a]) @ Z[b])
+    ZphiZphihat[b,a] = phihat*((phi*Z[b]) @ Z[a])
+
+    Zphihat = phihat*Z
+
+    # Create the progress bar
+    #progress_bar = tqdm(total=len(PoP),desc='PC elements',leave=False) if use_tqdm else None
+
+    # Define a lambda function for easy reading
+    mpt = lambda A,B: matrix_product_trace(A,B)
+
+    # Define the three cases for the pair covariance
+    def case1(a,b,c,d):             #(ab,cd)
+        # = gamma_{ac} gamma_{bd} tr([Z_d phi Z_b] phihat [Z_a phi Z_c] phihat) + 
+        #   gamma_{ad} gamma_{bc} tr([Z_c phi Z_b] phihat [Z_a phi Z_d] phihat)
+        a0 = matrix.jnp.zeros_like(a)
+        a2 = matrix.jnp.zeros_like(a)
+        a4 = orf[a,c]*orf[d,b] * mpt(ZphiZphihat[d,b], ZphiZphihat[a,c]) + \
+             orf[a,d]*orf[c,b] * mpt(ZphiZphihat[c,b], ZphiZphihat[a,d])
+        return a0+a2+a4
+    
+    def case2(a,b,c):               #(ab,ac)
+        # = gamma_{bc}            tr([Z_c phi Z_b] phihat [Z_a] phihat) + 
+        #   gamma_{ac} gamma_{ab} tr([Z_a phi Z_b] phihat [Z_a phi Z_c] phihat)
+        a0 = matrix.jnp.zeros_like(a)
+        a2 = orf[b,c] *          mpt(ZphiZphihat[c,b],Zphihat[a])
+        a4 = orf[a,c]*orf[a,b] * mpt(ZphiZphihat[a,b],ZphiZphihat[a,c])
+        return a0+a2+a4
+
+    def case3(a,b):                 #(ab,ab)
+        # = tr(Z_b phihat Z_a phihat) + gamma_{ab}^2 tr([Z_a phi Z_b] phihat [Z_a phi Z_b] phihat)
+        a0 =               mpt(Zphihat[b],Zphihat[a])
+        a2 = matrix.jnp.zeros_like(a)
+        a4 = orf[a,b]**2 * mpt(ZphiZphihat[b,a],ZphiZphihat[b,a])
+        return a0+a2+a4
+
+    # --------------------------------------------------------------------------
+    # Chunking code
+    def chunker(idx1,idx2,a,b,c=None,d=None):
+        n_chunks = int(len(a)/max_chunk)+1
+        for i in range(n_chunks):
+            l,h = i*max_chunk,(i+1)*max_chunk
+
+            if (c is None) and (d is None):
+                temp = case3(a[l:h],b[l:h])
+            elif d is None:
+                temp = case2(a[l:h],b[l:h],c[l:h])
+            else:
+                temp = case1(a[l:h],b[l:h],c[l:h],d[l:h])
+
+            C_m[idx1[l:h],idx2[l:h]] = temp
+            C_m[idx2[l:h],idx1[l:h]] = temp
+
+            #if use_tqdm: progress_bar.update(h-l)
+
+
+    # --------------------------------------------------------------------------
+    # Now lets calculate them!
+    C_m = matrix.jnp.zeros((len(pairs_idx),len(pairs_idx)),dtype=matrix.jnp.float64)
+
+    try: # This is used to close the progress bar if an exception occurs
+
+        # Case1: no matching pulsars--------------------------------------------
+        mask = (~psr_match[:,0] & ~psr_match[:,1]) & \
+               (~psr_inv_match[:,0] & ~psr_inv_match[:,1])
+        
+        p_idx1,p_idx2 = PoP_idx[mask].T
+        a,b,c,d = PoP[mask].T
+
+        chunker(p_idx1,p_idx2,a,b,c,d)
+    
+        
+        # Case2: 1 matching pulsar----------------------------------------------
+        mask = (psr_match[:,0] & ~psr_match[:,1]) # Check for (ab,ac)
+        p_idx1,p_idx2 = PoP_idx[mask].T
+        a,b,_,c = PoP[mask].T
+
+        chunker(p_idx1,p_idx2,a,b,c)
+
+
+        mask = (~psr_inv_match[:,0] & psr_inv_match[:,1]) # Check for (ab,bc)
+        p_idx1,p_idx2 = PoP_idx[mask].T
+        b,a,_,c = PoP[mask].T # Index swap a with b
+
+        chunker(p_idx1,p_idx2,a,b,c)
+
+
+        mask = (~psr_match[:,0] & psr_match[:,1]) # Check for (ab,cb)
+        p_idx1,p_idx2 = PoP_idx[mask].T
+        b,a,c,_ = PoP[mask].T # Index swap a with b
+
+        chunker(p_idx1,p_idx2,a,b,c)
+
+
+        # Case3: 2 matching pulsars---------------------------------------------
+        mask = psr_match[:,0] & psr_match[:,1] # Check for (ab,ab)
+        
+        p_idx1,p_idx2 = PoP_idx[mask].T
+        a,b,_,_ = PoP[mask].T 
+
+        chunker(p_idx1,p_idx2,a,b)
+
+
+    except Exception as e:
+    #    if use_tqdm: progress_bar.close()
+        msg = 'Exception occured during pair covariance creation!'
+        print(msg)
+    #    raise PCOSInteruptError(msg) from e
+        
+    #if use_tqdm: progress_bar.close()
+
+    # Include the final sigmas
+    C_m *= matrix.jnp.outer(norm_ab,norm_ab)
+
+    return C_m 
+
+
+
+
+
+
+
+
+
+
+def create_PFOS_pair_covariance(Z, phi, orf, norm_abk, narrowband, select_freq=None, 
+                                use_tqdm=True, max_chunk=300):
+    """Creates the GWB correlated pair covariance matrix for the PFOS.
+
+    This function creates the GWB correlated pair covariance matrix for the PFOS
+    for each frequency bin. This function takes advantage of the create_OS_pair_covariance
+    function where phihat is replaced with tilde{phi}(f_k) for each frequency.
+
+    You can also create covariance matrices for specific frequencies by setting the select_freq
+    parameter to the desired frequency index or None for all frequencies.
+
+    Args:
+        Z (numpy.ndarray): A N_pulasr array of 2N_frequencies x 2N_frequencies Z matrices from the OS.
+        phi (numpy.ndarray): A 2N_frequencies array of the estimated spectrum.
+        orf (numpy.ndarray): A N_pulsar x N_pulsar matrix of the ORF for each pair of pulsars.
+        norm_abk (numpy.ndarray): The N_pair array of PFOS normalizations for each frequency.
+        narrowband (bool): A flag to use the narrowband normalization instead of the broadband normalization.
+        select_freq (int): The frequency index to select for the pair covariance calculation. 
+            Defaults to None.
+        use_tqdm (bool): A flag to use the tqdm progress bar. Defaults to True.
+        max_chunk (int): The maximum number of simultaneous matrix calculations. 
+            Works best between 100-1000 but depends on the computer. Defaults to 300.
+
+    Returns:
+        numpy.ndarray: A N_freq x N_pairs x N_pairs matrix of the final covariance matrix
+    """
+    nfreq = len(Z[0])//2
+    # The frequency selector matrices (set of diagonals)
+    phitilde = matrix.jnp.repeat(matrix.jnp.diag(matrix.jnp.ones(nfreq)),2,axis=1)
+    
+    if select_freq is not None:
+        if narrowband:
+            sk = phi[2*select_freq]
+            Ck = create_OS_pair_covariance(Z, phitilde[select_freq], sk*phitilde[select_freq], 
+                                           orf, norm_abk, False, max_chunk)
+        else:
+            Ck = create_OS_pair_covariance(Z, phitilde[select_freq], phi, 
+                                           orf, norm_abk, False, max_chunk)
+            
+        return Ck
+
+    Ck = []
+    #iterable = tqdm(range(nfreq),desc='Freq covariances') if use_tqdm else range(nfreq)
+    iterable = range(nfreq)
+    for k in iterable:
+        if narrowband:
+            # Need to include the S(f_k) in the second tilde{phi}(f_k) to get the correct units
+            sk = phi[2*k]
+            C = create_OS_pair_covariance(Z, phitilde[k], sk*phitilde[k], 
+                                          orf, norm_abk[k], False, max_chunk)
+        else:
+            C = create_OS_pair_covariance(Z, phitilde[k], phi, 
+                                          orf, norm_abk[k], False, max_chunk)
+        Ck.append(C)
+    
+    return matrix.jnp.array(Ck)
+
+
+        
+
+
+
+def matrix_product_trace(A,B):
+    """Calculates the trace of the matrix product of two matrices.
+
+    returns tr(A @ B), supports vectorized operations. Be careful when giving
+    large chunks of matrices as it can be memory intensive.
+
+    Args:
+        A (numpy.ndarray): A matrix or a stack of n matrices [(n x) M x O]
+        B (numpy.ndarray): A matrix or a stack of n matrices [(n x) O x M]
+
+    Raises:
+        ValueError: If A and B are not 2D or 3D arrays
+    
+    Returns:
+        float: The trace of the matrix product of A and B
+    """
+    if A.ndim == 2 and B.ndim == 2:
+        return matrix.jnp.einsum('ij,ji->', A, B)
+    
+    elif A.ndim == 3 and B.ndim == 3:
+        return matrix.jnp.einsum('ijk,ikj->i', A, B)
+
+    else:
+        raise ValueError('A and B must be 2D or 3D arrays!')
