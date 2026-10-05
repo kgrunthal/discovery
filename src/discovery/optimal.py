@@ -1048,7 +1048,7 @@ class PFOS:
       
         npsr = len(Z)
         nfreq = len(Z[0])//2
-        
+        print(npsr, nfreq) 
         pairs_idx = matrix.jnp.array(matrix.jnp.triu_indices(npsr,1)).T
         a, b = pairs_idx[:,0], pairs_idx[:,1]
         
@@ -1056,7 +1056,6 @@ class PFOS:
         phi_til = matrix.jnp.repeat(phi_til,2)
         phi2 = phi/phi[2*freq]
        
-        print(Z.shape, a) 
         if narrowband:
             norms_abk = 1/(matrix.jnp.einsum('ijk,ikj->i',phi_til*Z[a],phi_til*Z[b]))
         else:
