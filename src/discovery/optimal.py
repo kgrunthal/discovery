@@ -911,6 +911,8 @@ class PFOS:
         self.gwpar = gwpars[0]
 
         self.pairs = [(i1, i2) for i1 in range(len(self.pos)) for i2 in range(i1 + 1, len(self.pos))]
+        self.a, self.b = matrix.jnp.array([i for (i,j) in self.pairs]), matrix.jnp.array([j for (i,j) in self.pairs])
+        
         # concrete, not a cached property: must not first be built inside a jit trace
         self.angles = matrix.jnparray([matrix.jnp.dot(self.pos[i], self.pos[j])
                                        for (i, j) in self.pairs])
@@ -1066,7 +1068,7 @@ class PFOS:
         # k == freq= frequency bin
 
         nfreq = len(Z[0])//2
-        a, b = matrix.jnp.array([i for (i,j) in self.pairs]), matrix.jnp.array([j for (i,j) in self.pairs])
+        a, b = self.a, self.b
         
         phi_til = matrix.jnp.zeros(nfreq).at[freq].set(1) 
         phi_til = matrix.jnp.repeat(phi_til,2)
@@ -1094,6 +1096,16 @@ class PFOS:
         
         Phi = self.gws[0].Phi.getN(params)
         orf_vals = orfa(self.angles)
+        Npsr = len(self.pos)
+        
+        idx_i, idx_j = matrix.jnp.concatenate([self.a, self.b]), matrix.jnp.concatenate([self.b, self.a])
+        orf_matrix = matrix.jnp.add.at(matrix.jnp.zeros((Npsr, Npsr)),
+                                       (idx_i, idx_j),
+                                       orf_vals)
+        orf_matrix = matrix.jnp.where(matrix.jnp.eye(Npsr, dtype=bool), 1.0, orf_matrix)
+        
+        
+        
         
         orf_matrix = matrix.jnp.diag( matrix.jnp.ones(len(self.pos)) )
         for ij, (i,j) in enumerate(self.pairs):
