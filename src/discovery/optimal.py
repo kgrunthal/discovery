@@ -899,9 +899,7 @@ class PFOS:
         # built eagerly, for the same reason as self.angles
         self._kernelsolves_raw = self._build_kernelsolves()
         
-        # number of frequencies in the GW 
-        self.nfreq = len(self.gws[0].Phi)
-        
+       
         # needed for chunkes pair covariance matrix calculation
         self.max_matrix_chunk = 300
     
@@ -1047,14 +1045,18 @@ class PFOS:
         # ab are the numbers of the pulsars; (ab) is the pair
         # Compute rho_ab(f_{freq}), sigma_ab(f_{freq}), and normalization_ab(f_{freq})
         # k == freq= frequency bin
+      
+        npsr = len(Z)
+        nfreq = len(Z[0])//2
         
-        a, b = self.pairs[:,0], self.pairs[:,1]
+        pairs_idx = matrix.jnp.array(matrix.jnp.triu_indices(npsr,1)).T
+        a, b = pairs_idx[:,0], pairs_idx[:,1]
         
-        phi_til = matrix.jnp.zeros(self.nfreq)  
-        phi_til[freq] = 1
+        phi_til = matrix.jnp.zeros(nfreq).at[freq].set(1) 
         phi_til = matrix.jnp.repeat(phi_til,2)
         phi2 = phi/phi[2*freq]
-        
+       
+        print(Z.shape, a) 
         if narrowband:
             norms_abk = 1/(matrix.jnp.einsum('ijk,ikj->i',phi_til*Z[a],phi_til*Z[b]))
         else:
@@ -1080,7 +1082,7 @@ class PFOS:
         X, Z = [], []
         
         for ks in self.kernelsolves:
-            kv, km = k(params)
+            kv, km = ks(params)
             X.append(kv)
             Z.append(km)
             
