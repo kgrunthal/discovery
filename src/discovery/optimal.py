@@ -5,6 +5,10 @@ from . import matrix
 
 import jax
 
+
+
+
+
 # these versions of the ORFs take only the angle, z = matrix.jnp.dot(pos1, pos2).
 # They are elementwise, and at zero separation (z == 1) they return the
 # cross-correlation limit plus a pulsar term: 0.5 + 0.5 for HD, and a small
@@ -91,6 +95,10 @@ def _ridge(S):
     scale = matrix.jnp.max(matrix.jnp.abs(matrix.jnp.diag(S)))
     tiny = matrix.jnp.finfo(matrix.jnp.asarray(S).dtype).tiny
     return matrix.jnp.where(scale > 0.0, 1e-12 * scale, tiny)
+
+
+
+
 
 
 # Detection statistics of van Haasteren et al. 2025 (arXiv:2509.06489), all
@@ -869,6 +877,17 @@ def eig2cdf(osxs, eigs, cutoff=1e-6, limit=100, epsabs=1e-9):
 
 
 
+# :::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+# ::                                                                         ::
+# ::    Per-frequency OS                                                     ::
+# ::                                                                         ::
+# :::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+    
+    
+    
+# =============================================================================
+# PFOS class
+# =============================================================================
 
 class PFOS:
     def __init__(self, gbl):
@@ -1125,10 +1144,364 @@ class PFOS:
 
 
 
+# =============================================================================
+# pair covariance calculation
+# =============================================================================
+
+
+# - helper functions ----------------------------------------------------------
+    
+_INDEX_CACHE = {}
+_KERNEL_CACHE = {}
+
+
+def matrix_product_trace(A,B):
+    """Calculates the trace of the matrix product of two matrices.
+
+    returns tr(A @ B), supports vectorized operations. Be careful when giving
+    large chunks of matrices as it can be memory intensive.
+
+    Args:
+        A (numpy.ndarray): A matrix or a stack of n matrices [(n x) M x O]
+        B (numpy.ndarray): A matrix or a stack of n matrices [(n x) O x M]
+
+    Raises:
+        ValueError: If A and B are not 2D or 3D arrays
+    
+    Returns:
+        float: The trace of the matrix product of A and B
+    """
+    if A.ndim == 2 and B.ndim == 2:
+        return matrix.jnp.einsum('ij,ji->', A, B)
+    
+    elif A.ndim == 3 and B.ndim == 3:
+        return matrix.jnp.einsum('ijk,ikj->i', A, B)
+
+    else:
+        raise ValueError('A and B must be 2D or 3D arrays!')
+        
+        
+
+
+
+def _build_pair_index_sets(npsr):
+    """Pure NumPy bookkeeping -- depends only on npsr. Cached by caller."""
+    pairs_idx = matrix.np.array(matrix.np.triu_indices(npsr, 1)).T
+    npair = len(pairs_idx)
+
+    PoP_idx = matrix.np.array(matrix.np.triu_indices(npair)).T
+    PoP = matrix.np.zeros((len(PoP_idx), 4), dtype=matrix.np.int64)
+    PoP[:, (0, 1)] = pairs_idx[PoP_idx[:, 0]]
+    PoP[:, (2, 3)] = pairs_idx[PoP_idx[:, 1]]
+
+    psr_match = (PoP[:, (0, 1)] == PoP[:, (2, 3)])
+    psr_inv_match = (PoP[:, (0, 1)] == PoP[:, (3, 2)])
+
+    cases = {}
+
+    mask = (~psr_match[:, 0] & ~psr_match[:, 1]) & \
+           (~psr_inv_match[:, 0] & ~psr_inv_match[:, 1])
+    idx1, idx2 = PoP_idx[mask].T
+    a, b, c, d = PoP[mask].T
+    cases['case1'] = ('case1', idx1, idx2, (a, b, c, d))
+
+    mask = psr_match[:, 0] & ~psr_match[:, 1]
+    idx1, idx2 = PoP_idx[mask].T
+    a, b, _, c = PoP[mask].T
+    cases['case2a'] = ('case2', idx1, idx2, (a, b, c))
+
+    mask = ~psr_inv_match[:, 0] & psr_inv_match[:, 1]
+    idx1, idx2 = PoP_idx[mask].T
+    b, a, _, c = PoP[mask].T
+    cases['case2b'] = ('case2', idx1, idx2, (a, b, c))
+
+    mask = ~psr_match[:, 0] & psr_match[:, 1]
+    idx1, idx2 = PoP_idx[mask].T
+    b, a, c, _ = PoP[mask].T
+    cases['case2c'] = ('case2', idx1, idx2, (a, b, c))
+
+    mask = psr_match[:, 0] & psr_match[:, 1]
+    idx1, idx2 = PoP_idx[mask].T
+    a, b, _, _ = PoP[mask].T
+    cases['case3'] = ('case3', idx1, idx2, (a, b))
+
+    return npair, pairs_idx, cases
 
 
 
 
+def _get_pair_index_sets(npsr):
+    """Cache wrapper around _build_pair_index_sets."""
+    if npsr not in _INDEX_CACHE:
+        _INDEX_CACHE[npsr] = _build_pair_index_sets(npsr)
+    return _INDEX_CACHE[npsr]
+
+
+
+
+@jax.jit
+def _case1_kernel(zz_db, zz_ac, zz_cb, zz_ad, orf_ac, orf_db, orf_ad, orf_cb):
+    return orf_ac * orf_db * matrix_product_trace(zz_db, zz_ac) + \
+           orf_ad * orf_cb * matrix_product_trace(zz_cb, zz_ad)
+
+
+@jax.jit
+def _case2_kernel(zz_cb, zphihat_a, zz_ab, zz_ac, orf_bc, orf_ac, orf_ab):
+    t2 = orf_bc * matrix_product_trace(zz_cb, zphihat_a)
+    t4 = orf_ac * orf_ab * matrix_product_trace(zz_ab, zz_ac)
+    return t2 + t4
+
+
+@jax.jit
+def _case3_kernel(zphihat_b, zphihat_a, zz_ba, orf_ab):
+    t0 = matrix_product_trace(zphihat_b, zphihat_a)
+    t4 = orf_ab ** 2 * matrix_product_trace(zz_ba, zz_ba)
+    return t0 + t4
+
+
+def _get_kernels(max_chunk):
+    """Cache wrapper -- JAX's own compilation cache already handles
+    per-shape recompilation, this just groups the kernel references."""
+    if max_chunk not in _KERNEL_CACHE:
+        _KERNEL_CACHE[max_chunk] = {
+            'case1': _case1_kernel,
+            'case2': _case2_kernel,
+            'case3': _case3_kernel,
+        }
+    return _KERNEL_CACHE[max_chunk]
+
+
+
+
+def _pad_to(arr, n_target):
+    """Pad a 1D index array up to n_target entries by repeating the last value."""
+    n = len(arr)
+    if n == n_target:
+        return arr
+    pad = n_target - n
+    return matrix.np.pad(arr, [(0, pad)] + [(0, 0)] * (arr.ndim - 1), mode='edge')
+
+
+
+
+def _build_ZphiZphihat(Z_np, phihat_np, phi_np, npsr, nfeat, a0, b0):
+    """Builds the Z phi Z phihat tensor entirely in NumPy (host memory)."""
+    ZphiZphihat = matrix.np.zeros((npsr, npsr, nfeat, nfeat), dtype=Z_np.dtype)
+    ZphiZphihat[a0, b0] = phihat_np * ((phi_np * Z_np[a0]) @ Z_np[b0])
+    ZphiZphihat[b0, a0] = phihat_np * ((phi_np * Z_np[b0]) @ Z_np[a0])
+    return ZphiZphihat
+
+
+
+
+def _run_chunk(case_type, kernels, ZphiZphihat, Zphihat, orf_np, idx_arrs):
+    """Runs one chunk's worth of case1/case2/case3 computation on-device,
+    given already host-gathered (padded) index arrays. Uses matrix.jnparray
+    (rather than a bare dtype cast) so device-side precision automatically
+    follows the backend's x64_enabled configuration."""
+    if case_type == 'case1':
+        a, b, c, d = idx_arrs
+        zz_db = ZphiZphihat[d, b]
+        zz_ac = ZphiZphihat[a, c]
+        zz_cb = ZphiZphihat[c, b]
+        zz_ad = ZphiZphihat[a, d]
+        orf_ac, orf_db = orf_np[a, c], orf_np[d, b]
+        orf_ad, orf_cb = orf_np[a, d], orf_np[c, b]
+
+        return kernels['case1'](
+            matrix.jnparray(zz_db), matrix.jnparray(zz_ac),
+            matrix.jnparray(zz_cb), matrix.jnparray(zz_ad),
+            matrix.jnparray(orf_ac), matrix.jnparray(orf_db),
+            matrix.jnparray(orf_ad), matrix.jnparray(orf_cb),
+        )
+
+    elif case_type == 'case2':
+        a, b, c = idx_arrs
+        zz_cb = ZphiZphihat[c, b]
+        zphihat_a = Zphihat[a]
+        zz_ab = ZphiZphihat[a, b]
+        zz_ac = ZphiZphihat[a, c]
+        orf_bc, orf_ac, orf_ab = orf_np[b, c], orf_np[a, c], orf_np[a, b]
+
+        return kernels['case2'](
+            matrix.jnparray(zz_cb), matrix.jnparray(zphihat_a),
+            matrix.jnparray(zz_ab), matrix.jnparray(zz_ac),
+            matrix.jnparray(orf_bc), matrix.jnparray(orf_ac),
+            matrix.jnparray(orf_ab),
+        )
+
+    else:  # case3
+        a, b = idx_arrs
+        zphihat_b, zphihat_a = Zphihat[b], Zphihat[a]
+        zz_ba = ZphiZphihat[b, a]
+        orf_ab = orf_np[a, b]
+
+        return kernels['case3'](
+            matrix.jnparray(zphihat_b), matrix.jnparray(zphihat_a),
+            matrix.jnparray(zz_ba), matrix.jnparray(orf_ab),
+        )
+# -----------------------------------------------------------------------------
+
+
+
+
+
+
+
+
+# - OS pair covariance --------------------------------------------------------
+
+def create_OS_pair_covariance(Z, phihat, phi, orf, norm_ab, max_chunk=2000):
+    """Creates the GWB correlated pair covariance matrix for the OS.
+
+    ZphiZphihat is built and kept entirely on the CPU (as plain NumPy) to
+    avoid holding the full npsr x npsr x nfeat x nfeat tensor on the GPU.
+    Only small, chunk-sized gathers of it are ever transferred to device,
+    where the actual trace computations are JIT-compiled and executed.
+    """
+    npsr = Z.shape[0]
+    nfeat = Z.shape[-1]
+
+    npair, pairs_idx, cases = _get_pair_index_sets(npsr)
+    a0, b0 = pairs_idx[:, 0], pairs_idx[:, 1]
+
+    kernels = _get_kernels(max_chunk)
+
+    Z_np = matrix.np.asarray(jax.device_get(Z))
+    phihat_np = matrix.np.asarray(jax.device_get(phihat))
+    phi_np = matrix.np.asarray(jax.device_get(phi))
+    orf_np = matrix.np.asarray(jax.device_get(orf))
+
+    ZphiZphihat = _build_ZphiZphihat(Z_np, phihat_np, phi_np, npsr, nfeat, a0, b0)
+    Zphihat = phihat_np * Z_np
+
+    C_m = matrix.np.zeros((npair, npair), dtype=Z_np.dtype)
+
+    for name, (case_type, idx1, idx2, idx_arrs) in cases.items():
+        n = len(idx1)
+        if n == 0:
+            continue
+
+        n_chunks = -(-n // max_chunk)  # ceil division
+        for ci in range(n_chunks):
+            l, h = ci * max_chunk, min((ci + 1) * max_chunk, n)
+            size = h - l
+
+            sl = tuple(x[l:h] for x in idx_arrs)
+            sl_padded = tuple(_pad_to(x, max_chunk) for x in sl)
+
+            out = _run_chunk(case_type, kernels, ZphiZphihat, Zphihat, orf_np, sl_padded)
+
+            out_np = matrix.np.asarray(jax.device_get(out))[:size]
+            i1, i2 = idx1[l:h], idx2[l:h]
+            C_m[i1, i2] = out_np
+            C_m[i2, i1] = out_np
+
+    C_m *= matrix.np.outer(matrix.np.asarray(jax.device_get(norm_ab)),
+                           matrix.np.asarray(jax.device_get(norm_ab)))
+
+    return matrix.jnparray(C_m)
+# -----------------------------------------------------------------------------
+
+
+
+
+# - PFOS pair covariance ------------------------------------------------------
+def create_PFOS_pair_covariance(Z, phi, orf, norm_abk, narrowband, select_freq=None, 
+                                use_tqdm=True, max_chunk=300):
+    """Creates the GWB correlated pair covariance matrix for the PFOS.
+
+    This function creates the GWB correlated pair covariance matrix for the PFOS
+    for each frequency bin. This function takes advantage of the create_OS_pair_covariance
+    function where phihat is replaced with tilde{phi}(f_k) for each frequency.
+
+    You can also create covariance matrices for specific frequencies by setting the select_freq
+    parameter to the desired frequency index or None for all frequencies.
+
+    Args:
+        Z (numpy.ndarray): A N_pulasr array of 2N_frequencies x 2N_frequencies Z matrices from the OS.
+        phi (numpy.ndarray): A 2N_frequencies array of the estimated spectrum.
+        orf (numpy.ndarray): A N_pulsar x N_pulsar matrix of the ORF for each pair of pulsars.
+        norm_abk (numpy.ndarray): The N_pair array of PFOS normalizations for each frequency.
+        narrowband (bool): A flag to use the narrowband normalization instead of the broadband normalization.
+        select_freq (int): The frequency index to select for the pair covariance calculation. 
+            Defaults to None.
+        use_tqdm (bool): A flag to use the tqdm progress bar. Defaults to True.
+        max_chunk (int): The maximum number of simultaneous matrix calculations. 
+            Works best between 100-1000 but depends on the computer. Defaults to 300.
+
+    Returns:
+        numpy.ndarray: A N_freq x N_pairs x N_pairs matrix of the final covariance matrix
+    """
+    nfreq = len(Z[0])//2
+    # The frequency selector matrices (set of diagonals)
+    phitilde = matrix.jnp.repeat(matrix.jnp.diag(matrix.jnp.ones(nfreq)),2,axis=1)
+    
+    if select_freq is not None:
+        if narrowband:
+            sk = phi[2*select_freq]
+            Ck = create_OS_pair_covariance(Z, phitilde[select_freq], sk*phitilde[select_freq], 
+                                           orf, norm_abk, False, max_chunk)
+        else:
+            Ck = create_OS_pair_covariance(Z, phitilde[select_freq], phi, 
+                                           orf, norm_abk, False, max_chunk)
+            
+        return Ck
+
+    Ck = []
+    #iterable = tqdm(range(nfreq),desc='Freq covariances') if use_tqdm else range(nfreq)
+    iterable = range(nfreq)
+    for k in iterable:
+        if narrowband:
+            # Need to include the S(f_k) in the second tilde{phi}(f_k) to get the correct units
+            sk = phi[2*k]
+            C = create_OS_pair_covariance(Z, phitilde[k], sk*phitilde[k], 
+                                          orf, norm_abk[k], False, max_chunk)
+        else:
+            C = create_OS_pair_covariance(Z, phitilde[k], phi, 
+                                          orf, norm_abk[k], False, max_chunk)
+        Ck.append(C)
+    
+    return matrix.jnp.array(Ck)
+# -----------------------------------------------------------------------------
+
+
+        
+
+
+
+
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+'''
 # copied from defiant, translated to jax.numpy
 
 def create_OS_pair_covariance(Z, phihat, phi, orf, norm_ab, use_tqdm=True, max_chunk=300):
@@ -1298,99 +1671,4 @@ def create_OS_pair_covariance(Z, phihat, phi, orf, norm_ab, use_tqdm=True, max_c
     C_m *= matrix.jnp.outer(norm_ab,norm_ab)
 
     return C_m 
-
-
-
-
-
-
-
-
-
-
-def create_PFOS_pair_covariance(Z, phi, orf, norm_abk, narrowband, select_freq=None, 
-                                use_tqdm=True, max_chunk=300):
-    """Creates the GWB correlated pair covariance matrix for the PFOS.
-
-    This function creates the GWB correlated pair covariance matrix for the PFOS
-    for each frequency bin. This function takes advantage of the create_OS_pair_covariance
-    function where phihat is replaced with tilde{phi}(f_k) for each frequency.
-
-    You can also create covariance matrices for specific frequencies by setting the select_freq
-    parameter to the desired frequency index or None for all frequencies.
-
-    Args:
-        Z (numpy.ndarray): A N_pulasr array of 2N_frequencies x 2N_frequencies Z matrices from the OS.
-        phi (numpy.ndarray): A 2N_frequencies array of the estimated spectrum.
-        orf (numpy.ndarray): A N_pulsar x N_pulsar matrix of the ORF for each pair of pulsars.
-        norm_abk (numpy.ndarray): The N_pair array of PFOS normalizations for each frequency.
-        narrowband (bool): A flag to use the narrowband normalization instead of the broadband normalization.
-        select_freq (int): The frequency index to select for the pair covariance calculation. 
-            Defaults to None.
-        use_tqdm (bool): A flag to use the tqdm progress bar. Defaults to True.
-        max_chunk (int): The maximum number of simultaneous matrix calculations. 
-            Works best between 100-1000 but depends on the computer. Defaults to 300.
-
-    Returns:
-        numpy.ndarray: A N_freq x N_pairs x N_pairs matrix of the final covariance matrix
-    """
-    nfreq = len(Z[0])//2
-    # The frequency selector matrices (set of diagonals)
-    phitilde = matrix.jnp.repeat(matrix.jnp.diag(matrix.jnp.ones(nfreq)),2,axis=1)
-    
-    if select_freq is not None:
-        if narrowband:
-            sk = phi[2*select_freq]
-            Ck = create_OS_pair_covariance(Z, phitilde[select_freq], sk*phitilde[select_freq], 
-                                           orf, norm_abk, False, max_chunk)
-        else:
-            Ck = create_OS_pair_covariance(Z, phitilde[select_freq], phi, 
-                                           orf, norm_abk, False, max_chunk)
-            
-        return Ck
-
-    Ck = []
-    #iterable = tqdm(range(nfreq),desc='Freq covariances') if use_tqdm else range(nfreq)
-    iterable = range(nfreq)
-    for k in iterable:
-        if narrowband:
-            # Need to include the S(f_k) in the second tilde{phi}(f_k) to get the correct units
-            sk = phi[2*k]
-            C = create_OS_pair_covariance(Z, phitilde[k], sk*phitilde[k], 
-                                          orf, norm_abk[k], False, max_chunk)
-        else:
-            C = create_OS_pair_covariance(Z, phitilde[k], phi, 
-                                          orf, norm_abk[k], False, max_chunk)
-        Ck.append(C)
-    
-    return matrix.jnp.array(Ck)
-
-
-        
-
-
-
-def matrix_product_trace(A,B):
-    """Calculates the trace of the matrix product of two matrices.
-
-    returns tr(A @ B), supports vectorized operations. Be careful when giving
-    large chunks of matrices as it can be memory intensive.
-
-    Args:
-        A (numpy.ndarray): A matrix or a stack of n matrices [(n x) M x O]
-        B (numpy.ndarray): A matrix or a stack of n matrices [(n x) O x M]
-
-    Raises:
-        ValueError: If A and B are not 2D or 3D arrays
-    
-    Returns:
-        float: The trace of the matrix product of A and B
-    """
-    if A.ndim == 2 and B.ndim == 2:
-        return matrix.jnp.einsum('ij,ji->', A, B)
-    
-    elif A.ndim == 3 and B.ndim == 3:
-        return matrix.jnp.einsum('ijk,ikj->i', A, B)
-
-    else:
-        raise ValueError('A and B must be 2D or 3D arrays!')
+'''
