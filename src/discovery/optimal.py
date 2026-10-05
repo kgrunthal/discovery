@@ -1098,10 +1098,9 @@ class PFOS:
         Npsr = len(self.pos)
         
         idx_i, idx_j = matrix.jnp.concatenate([self.a, self.b]), matrix.jnp.concatenate([self.b, self.a])
+        
         orf_matrix = matrix.jnp.zeros((Npsr, Npsr))
-        orf_matrix = matrix.jnp.add.at(orf_matrix,
-                                       (idx_i, idx_j),
-                                       orf_vals)
+        orf_matrix = orf_matrix.at[idx_i, idx_j].add(matrix.jnp.concatenate([orf_vals, orf_vals]))
         orf_matrix = matrix.jnp.where(matrix.jnp.eye(Npsr, dtype=bool), 1.0, orf_matrix)
         
 
