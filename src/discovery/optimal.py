@@ -1116,7 +1116,7 @@ class PFOS:
             method = 'woodbury'
             Sigma = create_PFOS_pair_covariance(Z, Phi, orf_matrix, 
                                 norm, narrowband, k,
-                                use_tqdm, self.max_matrix_chunk)
+                                self.max_matrix_chunk)
         
         else:
             method= 'diagonal'
@@ -1408,7 +1408,7 @@ def create_OS_pair_covariance(Z, phihat, phi, orf, norm_ab, max_chunk=2000):
 
 # - PFOS pair covariance ------------------------------------------------------
 def create_PFOS_pair_covariance(Z, phi, orf, norm_abk, narrowband, select_freq=None, 
-                                use_tqdm=True, max_chunk=300):
+                                max_chunk=300):
     """Creates the GWB correlated pair covariance matrix for the PFOS.
 
     This function creates the GWB correlated pair covariance matrix for the PFOS
@@ -1437,14 +1437,17 @@ def create_PFOS_pair_covariance(Z, phi, orf, norm_abk, narrowband, select_freq=N
     # The frequency selector matrices (set of diagonals)
     phitilde = matrix.jnp.repeat(matrix.jnp.diag(matrix.jnp.ones(nfreq)),2,axis=1)
     
+    
+    # create_OS_pair_covariance(Z, phihat, phi, orf, norm_ab, max_chunk=2000)
+    
     if select_freq is not None:
         if narrowband:
             sk = phi[2*select_freq]
             Ck = create_OS_pair_covariance(Z, phitilde[select_freq], sk*phitilde[select_freq], 
-                                           orf, norm_abk, False, max_chunk)
+                                           orf, norm_abk, max_chunk)
         else:
             Ck = create_OS_pair_covariance(Z, phitilde[select_freq], phi, 
-                                           orf, norm_abk, False, max_chunk)
+                                           orf, norm_abk, max_chunk)
             
         return Ck
 
@@ -1456,10 +1459,10 @@ def create_PFOS_pair_covariance(Z, phi, orf, norm_abk, narrowband, select_freq=N
             # Need to include the S(f_k) in the second tilde{phi}(f_k) to get the correct units
             sk = phi[2*k]
             C = create_OS_pair_covariance(Z, phitilde[k], sk*phitilde[k], 
-                                          orf, norm_abk[k], False, max_chunk)
+                                          orf, norm_abk[k], max_chunk)
         else:
             C = create_OS_pair_covariance(Z, phitilde[k], phi, 
-                                          orf, norm_abk[k], False, max_chunk)
+                                          orf, norm_abk[k], max_chunk)
         Ck.append(C)
     
     return matrix.jnp.array(Ck)
