@@ -1074,7 +1074,6 @@ class PFOS:
         phi_til = matrix.jnp.repeat(phi_til,2)
         phi2 = phi/phi[2*freq]
        
-        print(Z.shape, a) 
         if narrowband:
             norms_abk = 1/(matrix.jnp.einsum('ijk,ikj->i',phi_til*Z[a],phi_til*Z[b]))
         else:
@@ -1384,6 +1383,8 @@ def create_OS_pair_covariance(Z, phihat, phi, orf, norm_ab, max_chunk=2000):
     phi_np = matrix.np.asarray(jax.device_get(phi))
     orf_np = matrix.np.asarray(jax.device_get(orf))
 
+    print(orf_np[0])
+    
     ZphiZphihat = _build_ZphiZphihat(Z_np, phihat_np, phi_np, npsr, nfeat, a0, b0)
     Zphihat = phihat_np * Z_np
 
