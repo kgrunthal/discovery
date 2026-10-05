@@ -1085,6 +1085,8 @@ class PFOS:
             kv, km = ks(params)
             X.append(kv)
             Z.append(km)
+        X = matrix.jnp.array(X)
+        Z = matrix.jnp.array(Z)
             
         rho_k, sig_k, norm = self._compute_rhok_sigk(X, Z, Phi, k, narrowband)
         s_diag = matrix.jnp.diag(sig_k**2)
