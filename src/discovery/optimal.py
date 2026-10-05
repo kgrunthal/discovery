@@ -1098,18 +1098,13 @@ class PFOS:
         Npsr = len(self.pos)
         
         idx_i, idx_j = matrix.jnp.concatenate([self.a, self.b]), matrix.jnp.concatenate([self.b, self.a])
-        orf_matrix = matrix.jnp.add.at(matrix.jnp.zeros((Npsr, Npsr)),
+        orf_matrix = matrix.jnp.zeros((Npsr, Npsr))
+        orf_matrix = matrix.jnp.add.at(orf_matrix,
                                        (idx_i, idx_j),
                                        orf_vals)
         orf_matrix = matrix.jnp.where(matrix.jnp.eye(Npsr, dtype=bool), 1.0, orf_matrix)
         
-        
-        
-        
-        orf_matrix = matrix.jnp.diag( matrix.jnp.ones(len(self.pos)) )
-        for ij, (i,j) in enumerate(self.pairs):
-            orf_matrix[i][j] = orf_matrix[j][i] = orf_vals[ij]
-            
+
         k = select_freq
         X, Z = [], []
         
