@@ -1064,12 +1064,9 @@ class PFOS:
         # ab are the numbers of the pulsars; (ab) is the pair
         # Compute rho_ab(f_{freq}), sigma_ab(f_{freq}), and normalization_ab(f_{freq})
         # k == freq= frequency bin
-      
-        npsr = len(Z)
+
         nfreq = len(Z[0])//2
-        print(npsr, nfreq) 
-        pairs_idx = matrix.jnp.array(matrix.jnp.triu_indices(npsr,1)).T
-        a, b = pairs_idx[:,0], pairs_idx[:,1]
+        a, b = matrix.jnp.array([i for (i,j) in self.pairs]), matrix.jnp.array([j for (i,j) in self.pairs])
         
         phi_til = matrix.jnp.zeros(nfreq).at[freq].set(1) 
         phi_til = matrix.jnp.repeat(phi_til,2)
@@ -1095,7 +1092,12 @@ class PFOS:
                      return_pair_vals=True, select_freq=None):
         
         Phi = self.gws[0].Phi.getN(params)
-        orf_matrix = orfa(self.angles)
+        orf_vals = orfa(self.angles)
+        
+        orf_matrix = matrix.jnp.diag( matrix.jnp.ones(len(self.pos)) )
+        for ij, (i,j) in enumerate(self.pairs):
+            orf_matrix[i][j] = orf_matrix[j][i] = orf_vals[ij]
+            
         k = select_freq
         X, Z = [], []
         
@@ -1109,9 +1111,6 @@ class PFOS:
         rho_k, sig_k, norm = self._compute_rhok_sigk(X, Z, Phi, k, narrowband)
         s_diag = matrix.jnp.diag(sig_k**2)
         
-        
-        
-        use_tqdm = False
         if pair_covariance:
             method = 'woodbury'
             Sigma = create_PFOS_pair_covariance(Z, Phi, orf_matrix, 
