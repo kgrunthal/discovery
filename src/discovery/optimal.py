@@ -1372,6 +1372,8 @@ def create_OS_pair_covariance(Z, phihat, phi, orf, norm_ab, max_chunk=2000):
     phi_np = matrix.np.asarray(jax.device_get(phi))
     orf_np = matrix.np.asarray(jax.device_get(orf))
 
+    print(orf_np[0])
+    
     ZphiZphihat = _build_ZphiZphihat(Z_np, phihat_np, phi_np, npsr, nfeat, a0, b0)
     Zphihat = phihat_np * Z_np
 
