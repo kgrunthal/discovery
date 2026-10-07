@@ -1131,7 +1131,7 @@ class PFOS:
             
         
         if return_pair_vals:
-            out = {'Sk': Sk, 'Sks': Sks, 'rho_k': rho_k, 'sig_k': sig_k, 'Sigma': Sigma}
+            out = {'Sk': Sk, 'Sks': Sks, 'rho_k': rho_k, 'sig_k': sig_k, 'Sigma': Sigma, 'xi': self.angles}
         
         else:
             out = {'Sk': Sk, 'Sks': Sks}
