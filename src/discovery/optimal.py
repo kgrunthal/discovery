@@ -983,7 +983,6 @@ class PFOS:
             A = s
             K = C - A
             In = matrix.jnp.eye(A.shape[0])
-        
             cinv = self._woodbury_inverse(A,In,In,K)
 
             fisher = X.T @ cinv @ X
@@ -1002,7 +1001,7 @@ class PFOS:
         return theta, cov
             
             
-    def _woodbury_inverse(A, U, C, V, ret_cond = False):
+    def _woodbury_inverse(self, A, U, C, V, ret_cond = False):
         """A function to compute the inverse of a matrix using the Woodbury matrix identity.
 
         This function computes the inverse of a matrix using the Woodbury matrix identity 
@@ -1024,7 +1023,6 @@ class PFOS:
         Returns:
             np.ndarray: The inverse of the matrix (A + UCV)^-1
         """
-
         Ainv = matrix.jnp.diag( 1/matrix.jnp.diag(A) )
         Cinv = matrix.jnp.linalg.pinv(C)
 
@@ -1103,7 +1101,6 @@ class PFOS:
         orf_matrix = orf_matrix.at[idx_i, idx_j].add(matrix.jnp.concatenate([orf_vals, orf_vals]))
         orf_matrix = matrix.jnp.where(matrix.jnp.eye(Npsr, dtype=bool), 1.0, orf_matrix)
         
-
         k = select_freq
         X, Z = [], []
         
@@ -1127,10 +1124,9 @@ class PFOS:
             method= 'diagonal'
             Sigma = matrix.jnp.diag(sig_k**2)
         
-        
         # compute the PFOS estimates
         # A = Sk; S = Sks
-        Sk, Sks = self._linear_solve(orf_matrix, Sigma, rho_k, s=s_diag,
+        Sk, Sks = self._linear_solve(orf_vals, Sigma, rho_k, s=s_diag,
                                   method=method)
             
         
@@ -1377,7 +1373,6 @@ def create_OS_pair_covariance(Z, phihat, phi, orf, norm_ab, max_chunk=2000):
     phi_np = matrix.np.asarray(jax.device_get(phi))
     orf_np = matrix.np.asarray(jax.device_get(orf))
 
-    print(orf_np[0])
     
     ZphiZphihat = _build_ZphiZphihat(Z_np, phihat_np, phi_np, npsr, nfeat, a0, b0)
     Zphihat = phihat_np * Z_np
