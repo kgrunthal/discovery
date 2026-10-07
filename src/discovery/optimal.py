@@ -1131,11 +1131,11 @@ class PFOS:
         # compute the PFOS estimates
         # A = Sk; S = Sks
         Sk, Sks = self._linear_solve(orf_matrix, Sigma, rho_k, s=s_diag,
-                                  method=method)
+                                     method=method)
             
         
         if return_pair_vals:
-            out = {'Sk': Sk, 'Sks': Sks, 'rho_k': rho_k, 'sig_k': sig_k, 'Sigma': Sigma}
+            out = {'Sk': Sk, 'Sks': Sks, 'rho_k': rho_k, 'sig_k': sig_k, 'Sigma': Sigma, 'xi': self.angles}
         
         else:
             out = {'Sk': Sk, 'Sks': Sks}
